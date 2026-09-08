@@ -116,11 +116,15 @@ def build_flags_state() -> tuple[dict, dict]:
         "manual_scanner": cc.Manual_Scanner_MODE,
         "no_csv_error": cc.NO_CSV_ERROR,
         "no_csv_file": getattr(cc, "NO_CSV_FILE", None),
+        "scan_skipped": getattr(cc, "SCAN_SKIPPED", False),
+        "scan_skipped_count": getattr(cc, "SCAN_SKIPPED_COUNT", 0),
     }
     flags2 = {
         "manual_scanner": cc.Manual_Scanner_MODE2,
         "no_csv_error": cc.NO_CSV_ERROR2,
         "no_csv_file": getattr(cc, "NO_CSV_FILE2", None),
+        "scan_skipped": getattr(cc, "SCAN_SKIPPED2", False),
+        "scan_skipped_count": getattr(cc, "SCAN_SKIPPED_COUNT2", 0),
     }
     return flags1, flags2
 

@@ -53,6 +53,8 @@ async def check_flags():
             "manual_scanner": cc.Manual_Scanner_MODE,
             "no_csv_error": cc.NO_CSV_ERROR,
             "no_csv_file": getattr(cc, "NO_CSV_FILE", None),
+            "scan_skipped": getattr(cc, "SCAN_SKIPPED", False),
+            "scan_skipped_count": getattr(cc, "SCAN_SKIPPED_COUNT", 0),
         }
     )
 
@@ -65,6 +67,8 @@ async def check_flags2():
             "manual_scanner": cc.Manual_Scanner_MODE2,
             "no_csv_error": cc.NO_CSV_ERROR2,
             "no_csv_file": getattr(cc, "NO_CSV_FILE2", None),
+            "scan_skipped": getattr(cc, "SCAN_SKIPPED2", False),
+            "scan_skipped_count": getattr(cc, "SCAN_SKIPPED_COUNT2", 0),
         }
     )
 
@@ -129,3 +133,23 @@ async def control2():
         return JSONResponse({"status": "success"}, status_code=200)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+# ----------------------------------------------------------------------
+# Scan-skipped alerts (Manual mode = OFF)
+#
+# لما الـ Manual mode يكون مقفول، السكان الفاشل مش بيفتح popup ولا بيرن
+# بازر — بيتسجّل فلاج هنا بس، والواجهة بتعرضه في جرس الـ Alerts.
+# ----------------------------------------------------------------------
+@router.post("/scan_skipped/ack", name="Manual.scan_skipped_ack")
+async def scan_skipped_ack():
+    cc.SCAN_SKIPPED = False
+    cc.SCAN_SKIPPED_COUNT = 0
+    return JSONResponse({"status": "success"})
+
+
+@router.post("/scan_skipped2/ack", name="Manual.scan_skipped_ack2")
+async def scan_skipped_ack2():
+    cc.SCAN_SKIPPED2 = False
+    cc.SCAN_SKIPPED_COUNT2 = 0
+    return JSONResponse({"status": "success"})

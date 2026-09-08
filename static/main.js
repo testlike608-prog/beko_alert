@@ -302,6 +302,30 @@ function applyFlags(data, modalId, csvAlertId) {
   } else {
     clearAlert(csvAlertId);
   }
+
+  // Manual mode = OFF -> تريجر من غير سكان: alert بس
+  const skipId = 'scanSkipped' + station;
+  if (data.scan_skipped === true) {
+    const n = data.scan_skipped_count || 1;
+    setAlert(skipId, {
+      title:   'Scan Failed (Manual mode OFF)',
+      message: 'Trigger received in ' + (station === 2 ? 'INNER' : 'OUTER') +
+               ' station but scanning failed — the fridge was skipped and the sequence continued.',
+      file:    'Skipped fridges: ' + n,
+      action:  () => ackScanSkipped(station),
+      actionLabel: 'Dismiss'
+    });
+  } else {
+    clearAlert(skipId);
+  }
+}
+
+async function ackScanSkipped(station) {
+  const url = station === 2 ? '/scan_skipped2/ack' : '/scan_skipped/ack';
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (res.ok) clearAlert('scanSkipped' + station);
+  } catch (e) { console.error('Network error:', e); }
 }
 
 // النسخ دي بتستخدم للـ fallback بس (لما Socket.IO مش متاح)
@@ -979,9 +1003,96 @@ const defaultFixedOptions = {
   shelve_color:     [['None','00'],['white','9A'],['Black','9B'],['opt3','9C'],['opt4','9D'],['opt5','9E']],
 };
 
-let savedOptions = localStorage.getItem('saved_fixed_options');
-let FIXED_OPTIONS = savedOptions ? JSON.parse(savedOptions) : defaultFixedOptions;
+/* خيارات الاختبارات وأسماؤها بقت في test_options.json على السيرفر بدل
+   localStorage بتاع المتصفح — كاش الكروم كان بيتمسح فيضيع كل التعديلات،
+   وكل جهاز كان شايف نسخة مختلفة. */
+let FIXED_OPTIONS = JSON.parse(JSON.stringify(defaultFixedOptions));
+let TEST_LABELS   = {};
 let TESTS_MAP = {};
+
+/* ترحيل لمرة واحدة: أي إعدادات قديمة في localStorage بتتنقل للملف
+   وبعدين بتتمسح من المتصفح. */
+function collectLegacyTestOptions() {
+  const payload = { fixed_options: {}, labels: {} };
+  let found = false;
+
+  try {
+    const saved = localStorage.getItem('saved_fixed_options');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed && typeof parsed === 'object') { payload.fixed_options = parsed; found = true; }
+    }
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf('label_') === 0) {
+        payload.labels[k.slice(6)] = localStorage.getItem(k);
+        found = true;
+      }
+    }
+  } catch (e) { return null; }
+
+  return found ? payload : null;
+}
+
+function clearLegacyTestOptions() {
+  try {
+    localStorage.removeItem('saved_fixed_options');
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf('label_') === 0) keys.push(k);
+    }
+    keys.forEach(k => localStorage.removeItem(k));
+  } catch (e) { /* ignore */ }
+}
+
+async function saveTestOptions(payload) {
+  try {
+    const res = await fetch('/test_options', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) { showToast('Could not save test options', 'red'); return false; }
+    return true;
+  } catch (e) {
+    showToast('Network error while saving test options', 'red');
+    return false;
+  }
+}
+
+async function loadTestOptions() {
+  let data = { fixed_options: {}, labels: {} };
+  try {
+    const res = await fetch('/test_options');
+    data = await res.json();
+  } catch (e) {
+    console.error('Could not read test_options.json:', e);
+  }
+
+  const serverFixed  = (data && data.fixed_options) || {};
+  const serverLabels = (data && data.labels) || {};
+  const serverEmpty  = Object.keys(serverFixed).length === 0 && Object.keys(serverLabels).length === 0;
+
+  if (serverEmpty) {
+    const legacy = collectLegacyTestOptions();
+    if (legacy) {
+      const ok = await saveTestOptions(legacy);
+      if (ok) {
+        Object.assign(serverFixed,  legacy.fixed_options);
+        Object.assign(serverLabels, legacy.labels);
+        clearLegacyTestOptions();
+        showToast('Test options moved from the browser cache to test_options.json', 'green');
+      }
+    }
+  } else {
+    clearLegacyTestOptions();
+  }
+
+  FIXED_OPTIONS = JSON.parse(JSON.stringify(defaultFixedOptions));
+  Object.keys(serverFixed).forEach(k => { FIXED_OPTIONS[k] = serverFixed[k]; });
+  TEST_LABELS = Object.assign({}, serverLabels);
+}
 
 function initTestsMap(tests) {
   if (!Array.isArray(tests)) return;
@@ -996,7 +1107,7 @@ function initTestsMap(tests) {
 }
 
 function getLabelName(key) {
-  return localStorage.getItem('label_' + key) ||
+  return TEST_LABELS[key] ||
     document.querySelector(`[data-key="${key}"]`)?.textContent || key;
 }
 
@@ -1185,7 +1296,7 @@ function openOptionsEditor(fieldKey) {
       }
     } else {
       FIXED_OPTIONS[fieldKey] = newList;
-      localStorage.setItem('saved_fixed_options', JSON.stringify(FIXED_OPTIONS));
+      saveTestOptions({ fixed_options: { [fieldKey]: newList } });
     }
     openPicker(fieldKey);
   });
@@ -1237,12 +1348,15 @@ function validateForm() {
 function initEditableLabels() {
   document.querySelectorAll('.editable-label').forEach(el => {
     const key = el.getAttribute('data-key');
-    const savedName = localStorage.getItem('label_' + key);
+    const savedName = TEST_LABELS[key];
     if (savedName) el.textContent = savedName;
 
     el.addEventListener('click', e => e.stopPropagation());
     el.addEventListener('blur', function () {
-      localStorage.setItem('label_' + key, this.textContent.trim());
+      const name = this.textContent.trim();
+      if (!name || name === TEST_LABELS[key]) return;
+      TEST_LABELS[key] = name;
+      saveTestOptions({ labels: { [key]: name } });
     });
     el.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); this.blur(); }
@@ -1351,6 +1465,65 @@ function initDummyHandler(inputId, btnId, statusId, endpoint) {
   });
 }
 
+/* ─────────────────────────────────────────────
+   OPERATION MODES (Manual Scanner Mode ON/OFF)
+   بيتحفظ في config.json عن طريق /features
+───────────────────────────────────────────── */
+function setManualModeStatus(enabled, note) {
+  const box = $('manualModeStatus');
+  if (!box) return;
+  box.textContent = note || (enabled
+    ? 'ON — popup + buzzer on scan failure'
+    : 'OFF — alert only, sequence continues');
+  box.className = 'mt-2 text-xs font-semibold ' +
+    (enabled ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400');
+}
+
+async function loadFeatures() {
+  const toggle = $('manualModeToggle');
+  if (!toggle) return;
+  try {
+    const res  = await fetch('/features');
+    const data = await res.json();
+    const on   = data.manual_mode !== false;
+    toggle.checked = on;
+    setManualModeStatus(on);
+  } catch (e) {
+    setManualModeStatus(true, 'Could not read the current mode');
+  }
+}
+
+async function saveManualMode(enabled) {
+  try {
+    const res  = await fetch('/features', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ manual_mode: enabled })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setManualModeStatus(!enabled, (data && data.message) || 'Save failed — developer mode only');
+      const toggle = $('manualModeToggle');
+      if (toggle) toggle.checked = !enabled;
+      showToast('Could not save the mode', 'red');
+      return;
+    }
+    const on = !(data.features && data.features.manual_mode === false);
+    setManualModeStatus(on);
+    showToast('Manual Scanner Mode: ' + (on ? 'ON' : 'OFF'), 'green');
+  } catch (e) {
+    showToast('Network error while saving the mode', 'red');
+  }
+}
+
+function initFeatures() {
+  const toggle = $('manualModeToggle');
+  if (!toggle) return;
+  toggle.addEventListener('change', () => saveManualMode(toggle.checked));
+  loadFeatures();
+}
+
+
 function toggleAuthFields() {
   const auth     = $('Authentication');
   const login    = $('login');
@@ -1447,6 +1620,7 @@ document.addEventListener('DOMContentLoaded', () => {
       renderIoForm(loadIoSettings());
       loadEndpoints();
       loadVisionMasterPaths();
+      loadFeatures();
       $('ioMappingModal').classList.remove('hidden');
     });
     if (btnClose) btnClose.addEventListener('click', () => $('ioMappingModal').classList.add('hidden'));
@@ -1545,11 +1719,14 @@ document.addEventListener('DOMContentLoaded', () => {
     e.preventDefault();
   });
 
-  // Editable labels (create_program)
-  if (document.querySelectorAll('.editable-label').length) initEditableLabels();
-
-  // كل الاختبارات تبدأ بـ None (create_program)
-  if (document.querySelectorAll('.picker-btn').length) applyNoneDefaults();
+  // create_program: الخيارات والأسماء بتتقرا من test_options.json الأول
+  if (document.querySelectorAll('.picker-btn').length ||
+      document.querySelectorAll('.editable-label').length) {
+    loadTestOptions().then(() => {
+      if (document.querySelectorAll('.editable-label').length) initEditableLabels();
+      if (document.querySelectorAll('.picker-btn').length) applyNoneDefaults();
+    });
+  }
 
   // SQL status: push لو متاح، وإلا polling.
   // ملحوظة: /sql_status بيفتح اتصال pyodbc حقيقي، فكل تاب كان بيعمل
@@ -1568,6 +1745,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Manual scanner modals (shared)
   initAlertBell();
+  initFeatures();
   if ($('manualScannerModal') || $('manualScannerModal2')) startFlagPolling();
 
   // Station status (index) — polling دايمًا، والـ push بيسرّعه بس

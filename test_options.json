@@ -1,0 +1,135 @@
+{
+  "fixed_options": {
+    "color": [
+      [
+        "None",
+        "00"
+      ],
+      [
+        "white",
+        "6A"
+      ],
+      [
+        "Black",
+        "6B"
+      ],
+      [
+        "silver",
+        "6C"
+      ],
+      [
+        "brushed silver",
+        "6D"
+      ]
+    ],
+    "inverter_logo": [
+      [
+        "None",
+        "00"
+      ],
+      [
+        "inverter",
+        "7A"
+      ]
+    ],
+    "shelve_color": [
+      [
+        "None",
+        "00"
+      ],
+      [
+        "white",
+        "9W"
+      ],
+      [
+        "Black",
+        "9B"
+      ],
+      [
+        "silver",
+        "9S"
+      ]
+    ],
+    "display_logo": [
+      [
+        "None",
+        "00"
+      ],
+      [
+        "low",
+        "1F"
+      ],
+      [
+        "medium",
+        "1G"
+      ],
+      [
+        "High",
+        "1H"
+      ]
+    ],
+    "data_logo": [
+      [
+        "None",
+        "00"
+      ],
+      [
+        "25",
+        "6X"
+      ],
+      [
+        "10",
+        "9X"
+      ]
+    ],
+    "drawer_printing": [
+      [
+        "None",
+        "00"
+      ],
+      [
+        "Dairy",
+        "5A"
+      ],
+      [
+        "Crisper",
+        "5D"
+      ],
+      [
+        "harvest",
+        "5B"
+      ],
+      [
+        "freshzone",
+        "5E"
+      ]
+    ],
+    "fan_cover": [
+      [
+        "None",
+        "00"
+      ],
+      [
+        "Beko",
+        "8A"
+      ],
+      [
+        "Defy",
+        "8B"
+      ],
+      [
+        "Arcelik",
+        "8C"
+      ],
+      [
+        "Ariston",
+        "8D"
+      ]
+    ]
+  },
+  "labels": {
+    "shelve_color": "Shelve Color",
+    "display_logo": "Alignment",
+    "data_logo": "warranty"
+  }
+}

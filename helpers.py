@@ -1,7 +1,7 @@
 import csv
 import os,re,json
 import shutil
-from typing import List,Tuple,Dict
+from typing import List,Tuple,Dict,Any
 import threading
 import pandas as pd
 import ClientsClass
@@ -213,6 +213,87 @@ def load_tests():
 def save_tests(tests):
     with open(TESTS_FILE, "w", encoding="utf-8") as f:
         json.dump(tests, f, ensure_ascii=False, indent=2)
+
+
+# ----------------------------------------------------------------------
+# خيارات وأسماء الاختبارات الثابتة (كانت في localStorage بتاع المتصفح)
+#
+# قبل كده كانت متحفوظة في كاش الكروم، فأي مسح للكاش أو فتح البرنامج من
+# متصفح/جهاز تاني كان بيرجّع كل الأكواد والأسماء للافتراضي. دلوقتي بقت
+# في ملف test_options.json جنب البرنامج، فكل الأجهزة بتشوف نفس الإعداد.
+#
+# شكل الملف:
+#   {
+#     "fixed_options": { "front_logo": [["None","00"], ["Beko","1A"]], ... },
+#     "labels":        { "front_logo": "Front Logo", ... }
+#   }
+# ----------------------------------------------------------------------
+TEST_OPTIONS_FILE = os.path.join(BASE_DIR, "test_options.json")
+
+
+def load_test_options() -> Dict[str, Any]:
+    """قراءة الملف. بيرجع الشكل الفاضي لو الملف مش موجود أو بايظ."""
+    empty = {"fixed_options": {}, "labels": {}}
+    try:
+        if not os.path.exists(TEST_OPTIONS_FILE):
+            return empty
+        with open(TEST_OPTIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return empty
+        fixed = data.get("fixed_options")
+        labels = data.get("labels")
+        return {
+            "fixed_options": fixed if isinstance(fixed, dict) else {},
+            "labels": labels if isinstance(labels, dict) else {},
+        }
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[helpers] تعذّرت قراءة {TEST_OPTIONS_FILE} ({exc})", flush=True)
+        return empty
+
+
+def save_test_options(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    دمج وحفظ. بنكتب في ملف مؤقت وبعدين os.replace عشان لو البرنامج قفل
+    وسط الكتابة الملف القديم ما يبوظش.
+    """
+    current = load_test_options()
+    payload = payload if isinstance(payload, dict) else {}
+
+    fixed = payload.get("fixed_options")
+    if isinstance(fixed, dict):
+        clean = {}
+        for key, options in fixed.items():
+            if not isinstance(options, list):
+                continue
+            rows = []
+            for opt in options:
+                if isinstance(opt, (list, tuple)) and len(opt) >= 2:
+                    rows.append([str(opt[0]), str(opt[1])])
+                elif isinstance(opt, dict):
+                    rows.append([str(opt.get("name", "")), str(opt.get("code", ""))])
+            clean[str(key)] = rows
+        current["fixed_options"].update(clean)
+
+    labels = payload.get("labels")
+    if isinstance(labels, dict):
+        current["labels"].update({str(k): str(v) for k, v in labels.items()})
+
+    tmp_path = TEST_OPTIONS_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(current, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, TEST_OPTIONS_FILE)
+    return current
+
+
+def reset_test_options() -> Dict[str, Any]:
+    """مسح الملف كله — الواجهة بترجع للقيم الافتراضية."""
+    empty = {"fixed_options": {}, "labels": {}}
+    tmp_path = TEST_OPTIONS_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(empty, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, TEST_OPTIONS_FILE)
+    return empty
 #get the path
 def _csv_path(sku: str, part: str) -> str:
     safe_sku = re.sub(r'[^\w\-]', '', sku or "")

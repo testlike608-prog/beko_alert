@@ -38,6 +38,19 @@ default_mapping = {
     "READ_DI0": 0, "READ_DI1": 1, "READ_INPUTS_REG": 34
 }
 
+# ----------------------------------------------------------------------
+# خصائص التشغيل (features)
+#
+# manual_mode:
+#   True  = السلوك القديم — لو السكانر فشل بيطلع Manual Scanner popup
+#           والبازر بيرن لحد ما المشغّل يدخل الكود بإيده.
+#   False = مفيش popup ولا بازر — بيتسجّل alert بس إن فيه تريجر من غير
+#           سكان، والسيكونس بيكمّل عادي ويستنى تلاجة جديدة.
+# ----------------------------------------------------------------------
+default_features = {
+    "manual_mode": True,
+}
+
 default_vision_master = {
     "assembly_dir": "",     # فاضي = اكتشاف أوتوماتيكي من Program Files
     "solution_path": "",    # مسار ملف .solw / .sol
@@ -81,6 +94,7 @@ default_endpoints = {
 
 io_mapping: Dict[str, Any] = {}
 vision_master_config: Dict[str, Any] = {}
+features: Dict[str, Any] = {}
 endpoints: Dict[str, Any] = {}
 
 
@@ -128,7 +142,7 @@ def _merge_endpoints(saved: Any) -> Dict[str, Any]:
 
 def load_mapping():
     """تحميل الإعدادات من config.json مع دعم الشكل القديم المسطّح."""
-    global io_mapping, vision_master_config, endpoints
+    global io_mapping, vision_master_config, endpoints, features
 
     data = _read_config_file()
 
@@ -136,6 +150,7 @@ def load_mapping():
         io_mapping = default_mapping.copy()
         vision_master_config = default_vision_master.copy()
         endpoints = _merge_endpoints({})
+        features = default_features.copy()
         return
 
     if "io_mapping" in data:
@@ -148,12 +163,15 @@ def load_mapping():
         # قسم endpoints مش موجود في الملفات القديمة — _merge_endpoints
         # بترجّع الافتراضي كله في الحالة دي.
         endpoints = _merge_endpoints(data.get("endpoints"))
+        features = {**default_features, **(data.get("features") or {})}
+        features["manual_mode"] = bool(features.get("manual_mode", True))
     else:
         # الشكل القديم: الملف كله عبارة عن mapping
         print("[ioSetting] تحويل config.json للشكل الجديد (io_mapping / vision_master)")
         io_mapping = {**default_mapping, **data}
         vision_master_config = default_vision_master.copy()
         endpoints = _merge_endpoints({})
+        features = default_features.copy()
         save_config_to_file()
 
 
@@ -163,6 +181,7 @@ def save_config_to_file():
         "io_mapping": io_mapping,
         "vision_master": vision_master_config,
         "endpoints": endpoints,
+        "features": {**default_features, **(features or {})},
     }
     tmp_path = CONFIG_FILE + ".tmp"
     with open(tmp_path, 'w', encoding='utf-8') as file:
@@ -198,6 +217,42 @@ def save_vision_master_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     vision_master_config = {**get_vision_master_config(), **clean}
     save_config_to_file()
     return get_vision_master_config()
+
+
+# ----------------------------------------------------------------------
+# خصائص التشغيل (features)
+# ----------------------------------------------------------------------
+def get_features() -> Dict[str, Any]:
+    """نسخة من الخصائص الحالية مدموجة مع الافتراضي."""
+    merged = {**default_features, **(features or {})}
+    merged["manual_mode"] = bool(merged.get("manual_mode", True))
+    return merged
+
+
+def is_manual_mode_enabled() -> bool:
+    """
+    بيقراها ClientsClass وقت التشغيل مباشرة، عشان تغيير الإعداد من
+    الواجهة يبقى فوري من غير Restart.
+    """
+    return bool(get_features().get("manual_mode", True))
+
+
+def save_features(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """تحديث الخصائص وحفظها في config.json."""
+    global features
+
+    payload = payload if isinstance(payload, dict) else {}
+    current = get_features()
+
+    if "manual_mode" in payload:
+        value = payload.get("manual_mode")
+        if isinstance(value, str):
+            value = value.strip().lower() in ("1", "true", "on", "yes")
+        current["manual_mode"] = bool(value)
+
+    features = current
+    save_config_to_file()
+    return get_features()
 
 
 # ----------------------------------------------------------------------

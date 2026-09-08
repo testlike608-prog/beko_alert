@@ -56,6 +56,15 @@ global NO_CSV_FILE
 NO_CSV_FILE = None
 global NO_CSV_FILE2
 NO_CSV_FILE2 = None
+# تريجر جه والسكانر فشل والـ Manual mode مقفول -> alert بس من غير popup
+global SCAN_SKIPPED
+SCAN_SKIPPED = False
+global SCAN_SKIPPED2
+SCAN_SKIPPED2 = False
+global SCAN_SKIPPED_COUNT
+SCAN_SKIPPED_COUNT = 0
+global SCAN_SKIPPED_COUNT2
+SCAN_SKIPPED_COUNT2 = 0
 global Buzzer_Flag_to_OFF
 global Buzzer_Flag_to_OFF2
 global is_waiting
@@ -814,6 +823,7 @@ class App():
         global Manual_Scanner_MODE, Manual_Scanner_MODE2
         global NO_CSV_ERROR, NO_CSV_ERROR2
         global NO_CSV_FILE, NO_CSV_FILE2
+        global SCAN_SKIPPED, SCAN_SKIPPED2, SCAN_SKIPPED_COUNT, SCAN_SKIPPED_COUNT2
         your_s1_arrived_flag = False
         your_s2_arrived_flag = False
         your_s1_result = None
@@ -824,6 +834,10 @@ class App():
         NO_CSV_ERROR2 = False
         NO_CSV_FILE = None
         NO_CSV_FILE2 = None
+        SCAN_SKIPPED = False
+        SCAN_SKIPPED2 = False
+        SCAN_SKIPPED_COUNT = 0
+        SCAN_SKIPPED_COUNT2 = 0
 
     def Start_connetion(self):
 
@@ -1445,6 +1459,7 @@ class App():
         self.client_write_io._log_add("INFO", f"entered the seq of station 1")
 
         global Manual_Scanner_MODE, NO_CSV_ERROR, Buzzer_Flag_to_OFF,di
+        global SCAN_SKIPPED, SCAN_SKIPPED_COUNT
         global image_SN1, queue_manual_FOR_FAILURE, is_waiting  # Make sure we can access these
         global your_s1_result, your_s1_dummy, your_s1_arrived_flag
 
@@ -1484,7 +1499,21 @@ class App():
                     self.client_write_io.send_request(generate_modbus_command("SCANNER_S1", "OFF"), is_hex=True)    # scanner Off
                     
                     self.client_scanner_station1._log_add("info", f"Manual_Scanner_MODE [{Manual_Scanner_MODE}]")
-                    
+
+                    # ---- Manual mode OFF ----
+                    # مفيش popup ولا بازر: بنسجّل alert بس إن جه تريجر
+                    # من غير سكان، وبنسيب السيكونس يستنى تلاجة جديدة.
+                    if not ioSetting.is_manual_mode_enabled():
+                        SCAN_SKIPPED = True
+                        SCAN_SKIPPED_COUNT += 1
+                        Manual_Scanner_MODE = False
+                        self.client_scanner_station1._log_add(
+                            "WARNING",
+                            "S1: trigger received but scanning failed — manual mode is OFF, skipping this fridge",
+                        )
+                        di.clear()
+                        return
+
                     Manual_Scanner_MODE = True
                     while  is_waiting and not self._stop_event.is_set():
 
@@ -1588,6 +1617,7 @@ class App():
         self.client_write_io._log_add("INFO", f"entered the seq of station 2")
 
         global Manual_Scanner_MODE2, NO_CSV_ERROR2, Buzzer_Flag_to_OFF2
+        global SCAN_SKIPPED2, SCAN_SKIPPED_COUNT2
         global image_SN2, queue_manual2_FOR_FAILURE, is_waiting2  # Make sure we can access these
         global your_s2_arrived_flag, your_s2_dummy, your_s2_result
         queue = None
@@ -1631,7 +1661,19 @@ class App():
                     self.client_write_io.send_request(generate_modbus_command("SCANNER_S2", "OFF"), is_hex=True)    # scanner Off
                     
                     self.client_scanner_station2._log_add("info", f"Manual_Scanner_MODE2 [{Manual_Scanner_MODE2}]")
-                    
+
+                    # ---- Manual mode OFF ----  (نفس منطق المحطة 1)
+                    if not ioSetting.is_manual_mode_enabled():
+                        SCAN_SKIPPED2 = True
+                        SCAN_SKIPPED_COUNT2 += 1
+                        Manual_Scanner_MODE2 = False
+                        self.client_scanner_station2._log_add(
+                            "WARNING",
+                            "S2: trigger received but scanning failed — manual mode is OFF, skipping this fridge",
+                        )
+                        di2.clear()
+                        return
+
                     Manual_Scanner_MODE2 = True
                     is_waiting2 = True
                     if is_waiting2:

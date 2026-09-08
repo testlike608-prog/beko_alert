@@ -62,6 +62,27 @@ async def save_mapping(request: Request):
 
 
 # ----------------------------------------------------------------------
+# خصائص التشغيل (features) — Manual Scanner mode ON/OFF
+#
+# GET مفتوح لأي مستخدم مسجّل (الواجهة بتعرض الحالة)، أما الحفظ فـ dev بس.
+# ----------------------------------------------------------------------
+@router.get("/features", name="io_mapping.get_features")
+async def get_features(request: Request):
+    return JSONResponse(ioSetting.get_features())
+
+
+@router.post("/features", name="io_mapping.save_features")
+async def save_features(request: Request):
+    denied = require_dev(request)
+    if denied is not None:
+        return denied
+
+    payload = await request.json()
+    saved = ioSetting.save_features(payload or {})
+    return JSONResponse({"status": "success", "features": saved})
+
+
+# ----------------------------------------------------------------------
 # عناوين الأجهزة (IP / Port) — Developer mode فقط
 #
 # قبل كده كانت متكتوبة بإيد في ClientsClass.py، فتغيير IP كان محتاج

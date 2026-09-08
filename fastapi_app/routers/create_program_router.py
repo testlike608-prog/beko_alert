@@ -6,10 +6,10 @@ import os
 import re
 
 from fastapi import APIRouter, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from CreateProgram import PROGRAMS_DIR, _save_csv_file
-from helpers import load_tests
+from helpers import load_test_options, load_tests, save_test_options
 from ..core import templates
 
 router = APIRouter(tags=["create_program"])
@@ -193,3 +193,26 @@ async def create_program_submit(request: Request):
             "filename_s1": filename_s1, "filename_s2": filename_s2, "tests": tests,
         },
     )
+
+
+# ----------------------------------------------------------------------
+# خيارات وأسماء الاختبارات — بتتحفظ في test_options.json مش في كاش المتصفح
+# ----------------------------------------------------------------------
+@router.get("/test_options", name="CreateProgram.get_test_options")
+async def get_test_options():
+    return JSONResponse(load_test_options())
+
+
+@router.post("/test_options", name="CreateProgram.save_test_options")
+async def post_test_options(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+
+    try:
+        saved = save_test_options(payload or {})
+    except OSError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+    return JSONResponse({"status": "success", **saved})
