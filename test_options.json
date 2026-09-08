@@ -130,6 +130,7 @@
   "labels": {
     "shelve_color": "Shelve Color",
     "display_logo": "Alignment",
-    "data_logo": "warranty"
+    "data_logo": "warranty",
+    "fan_cover": "Fan Cover"
   }
 }

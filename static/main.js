@@ -1064,10 +1064,15 @@ async function saveTestOptions(payload) {
 async function loadTestOptions() {
   let data = { fixed_options: {}, labels: {} };
   try {
-    const res = await fetch('/test_options');
+    // cache-busting: الملف بيتغير من برّه الواجهة كمان
+    const res = await fetch('/test_options?t=' + Date.now(), { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
     data = await res.json();
+    console.log('[test_options] loaded from', data.path || 'server', data);
   } catch (e) {
     console.error('Could not read test_options.json:', e);
+    showToast('Could not read test_options.json — using defaults', 'red');
+    return;   // مانمسحش اللي محمّل بالفعل بالافتراضي
   }
 
   const serverFixed  = (data && data.fixed_options) || {};

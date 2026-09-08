@@ -200,7 +200,15 @@ async def create_program_submit(request: Request):
 # ----------------------------------------------------------------------
 @router.get("/test_options", name="CreateProgram.get_test_options")
 async def get_test_options():
-    return JSONResponse(load_test_options())
+    # no-store مهم: من غيره المتصفح ممكن يفضل شايف نسخة قديمة من الملف
+    # حتى بعد ما تتعدّل من الواجهة أو بالإيد.
+    from helpers import TEST_OPTIONS_FILE
+
+    data = load_test_options()
+    return JSONResponse(
+        {**data, "path": TEST_OPTIONS_FILE},
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
 
 
 @router.post("/test_options", name="CreateProgram.save_test_options")
