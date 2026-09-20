@@ -612,58 +612,14 @@
                            ' opacity-75' + (s.ping ? ' animate-ping' : '');
   }
 
-  // ------------------------------------------------------------------
-  // fetch بـ timeout.
-  //
-  // الباج الأصلي: fetch من غير timeout. لو السيرفر قبل الاتصال وما ردّش
-  // (threadpool مشغول، أو نداء .NET واقف جوه /process/status) الـ promise
-  // مكانتش بتخلص أبدًا — لا render ولا الـ catch كانوا بيشتغلوا، فالشارة
-  // كانت بتتجمّد على آخر حالة ومكانتش حتى بتوصل لـ "Offline".
-  // وأسوأ من كده: كل tick كان بيفتح طلب جديد معلّق، والمتصفح بيسمح بـ 6
-  // اتصالات للهوست الواحد — فبعد ثواني كل الطلبات التانية في الصفحة
-  // (Start/Stop، التوستات، حالة الـ SQL) كانت بتتقفل وراهم.
-  // ------------------------------------------------------------------
-  function fetchWithTimeout(url, options, ms) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), ms || 8000);
-    return fetch(url, { ...(options || {}), signal: ctrl.signal })
-      .finally(() => clearTimeout(timer));
-  }
-
-  // بنستنى فشلين ورا بعض قبل ما نقول Offline، عشان طلب واحد ضايع
-  // ما يخضّش المشغّل.
-  let pollFailures = 0;
-
-  function showOffline() {
-    badge.textContent = 'Offline';
-    badge.className = 'shrink-0 text-xs font-semibold px-3 py-1 rounded-full tracking-wider ' +
-                      'uppercase transition-opacity bg-amber-500 animate-pulse';
-
-    // مهم: من غير ده الأزرار كانت بتفضل على آخر حالة قبل القطع —
-    // يعني Start/Stop شكلهم شغال والسيرفر مش موجود أصلاً.
-    btnStart.disabled = btnStop.disabled = btnRestart.disabled = true;
-
-    // وde كمان: لو سبنا lastState زي ما هو، لما السيرفر يرجع بنفس
-    // الحالة، render مكانتش بتعلن أي حاجة وكانت الرسالة القديمة
-    // ("Stopping…" مثلاً) بتفضل واقفة على الشاشة للأبد.
-    lastState = null;
-    setMessage('Server unreachable — retrying…', 'err');
-  }
-
   async function refreshStatus() {
     try {
-      const res = await fetchWithTimeout('/process/status', { cache: 'no-store' }, 8000);
-
-      // 500 / 502 / 503 كانت بترجع return صامت: الشارة بتفضل مكتوب
-      // عليها Running والسيرفر واقع. دلوقتي بتتعامل زي أي فشل.
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-
-      const data = await res.json();
-      pollFailures = 0;
-      badge.classList.remove('opacity-60');   // ضمان فك أي تعتيم عالق
-      render(data);
+      const res = await fetch('/process/status', { cache: 'no-store' });
+      if (!res.ok) return;
+      render(await res.json());
     } catch (e) {
-      if (++pollFailures >= 2) showOffline();
+      badge.textContent = 'Offline';
+      badge.className = 'shrink-0 text-xs font-semibold px-3 py-1 rounded-full bg-amber-500 tracking-wider uppercase';
     }
   }
 
@@ -682,10 +638,7 @@
     setMessage(pendingText, 'busy');
 
     try {
-      // نفس السبب: من غير timeout، لو الطلب اتعلّق فالـ finally تحت
-      // مكانش بيشتغل — busy كان بيتصفّر من الحارس بس الشارة كانت
-      // بتفضل معتّمة (opacity-60) والرسالة واقفة على "Starting…".
-      const res  = await fetchWithTimeout('/process/' + action, { method: 'POST' }, 30000);
+      const res  = await fetch('/process/' + action, { method: 'POST' });
       const data = await res.json();
 
       setMessage(data.message || '', data.ok ? 'ok' : 'err');
@@ -694,10 +647,7 @@
       }
       render(data.status || {});
     } catch (e) {
-      const msg = (e && e.name === 'AbortError')
-        ? 'Request timed out — the server is not responding'
-        : 'Request failed: ' + (e && e.message ? e.message : e);
-      setMessage(msg, 'err');
+      setMessage('Request failed: ' + e.message, 'err');
       refreshStatus();
     } finally {
       clearTimeout(busyGuard);

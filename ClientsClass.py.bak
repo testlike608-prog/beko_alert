@@ -898,45 +898,27 @@ class App():
 # servers handling
     def _IO_read_SCANNER(self):
             global your_s1_arrived_flag, your_s2_arrived_flag
-            self.client_read_io._log_add("INFO", f"start reading DI2 from io")
-
-            # ----------------------------------------------------------
-            # DI2 = حساس الدَمي.
-            # التريجر على الحافة النازلة (negative edge): 1 -> 0.
-            #
-            # الترتيب هنا مقصود: بنقرا -> نحفظ القراءة السابقة في prev
-            # -> نحدّث last_DI2 فورًا -> وبعدين نقارن ونبعت.
-            # تحديث الحالة قبل الإرسال معناه إن أي استثناء في send_request
-            # (انقطاع لحظي مثلاً) ما يخليش نفس الحافة تتقرا تاني في الدورة
-            # الجاية وتعمل سكان مكرر للدَمي.
-            #
-            # وأي قراءة فاشلة (respond فاضي) بنتجاهلها من غير ما نلمس
-            # last_DI2، عشان ما نخترعش حافة نازلة من انقطاع في الشبكة.
-            # ----------------------------------------------------------
-            last_DI2 = b"\x00"
+            self.client_read_io._log_add("INFO", f"start reading from io")
+            last_DI0 = b"\x00"
+            last_DI1 = b"\x00"
 
             while self.client_read_io.connected and not self._stop_event.is_set():
                 try:
                     # توليد كود القراءة بناءً على إعدادات الويب
                     cmd_di2 = generate_modbus_command("READ_DI2", "READ_DI")
                     DI2_respond = self.client_read_io.send_request(message=cmd_di2, is_hex=True)
-
-                    if not DI2_respond:
-                        time.sleep(0.01)
-                        continue
-
-                    current_DI2 = DI2_respond[-1:]
-                    prev_DI2, last_DI2 = last_DI2, current_DI2
-
-                    # حافة نازلة: كان 1 وبقى 0
-                    if current_DI2 == b"\x00" and prev_DI2 == b"\x01":
+                    last_DI2 = DI2_respond[-1:] if DI2_respond else b"\x00"
+                    if DI2_respond and DI2_respond[-1:] == b"\x00" and last_DI2 == b"\x01":
                             self.client_write_io.send_request(generate_modbus_command("SCANNER_S1", "ON"), is_hex=True)    # scanner ON
                             time.sleep(0.1)
                             self.client_write_io.send_request(generate_modbus_command("SCANNER_S1", "OFF"), is_hex=True)    # scanner OFF
                             self.client_read_io._log_add("INFO", f"FRIDGE DUMMY SCANNED")
 
+                    last_DI2 = DI2_respond[-1:] if DI2_respond else b"\x00"
+      
+                    
                     time.sleep(0.01)
-
+                    
                 except Exception as e:
                     self.client_read_io._log_add("INFO", f"خطأ في القراءة: {e}")
        

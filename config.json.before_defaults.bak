@@ -1,16 +1,16 @@
 {
     "io_mapping": {
         "LIGHTING_S1": 8,
-        "LIGHTING_S2": 3,
+        "LIGHTING_S2": 1,
         "BUZZER_S1": 2,
-        "BUZZER_S2": 1,
+        "BUZZER_S2": 3,
         "SCANNER_S1": 4,
         "SCANNER_S2": 5,
         "TESTDONE_S1": 6,
         "TESTDONE_S2": 7,
         "FAILURE": 16,
         "READ_DI0": 0,
-        "READ_DI1": 4,
+        "READ_DI1": 1,
         "READ_DI2": 2,
         "READ_INPUTS_REG": 34
     },

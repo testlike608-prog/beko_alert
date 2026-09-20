@@ -486,14 +486,10 @@ async function resetErrorCondition() {
 /* ─────────────────────────────────────────────
    6. I/O MAPPING (index.html)
 ───────────────────────────────────────────── */
-// لازم تفضل *مطابقة* لـ ioSetting.default_mapping في البايثون.
-// قبل كده كانت مختلفة (LIGHTING_S2 و BUZZER_S1/S2 و READ_DI1)، يعني زرار
-// "Reset to Default" كان بيدّي توصيل غير اللي السيرفر بيستخدمه لو
-// config.json ضاع — نفس الزرار، نتيجتين مختلفتين.
 const ioDefaultMapping = {
-  LIGHTING_S1: 8, LIGHTING_S2: 3, BUZZER_S1: 2, BUZZER_S2: 1,
+  LIGHTING_S1: 8, LIGHTING_S2: 1, BUZZER_S1: 2, BUZZER_S2: 3,
   SCANNER_S1: 4, SCANNER_S2: 5, TESTDONE_S1: 6, TESTDONE_S2: 7, FAILURE: 16,
-  READ_DI0: 0, READ_DI1: 4, READ_DI2: 2, READ_INPUTS_REG: 34
+  READ_DI0: 0, READ_DI1: 1, READ_INPUTS_REG: 34
 };
 
 const ioOutputs = {
@@ -505,44 +501,12 @@ const ioOutputs = {
 };
 
 const ioInputs = {
-  READ_DI0: 'Read DI0 (S1 trigger)',
-  READ_DI1: 'Read DI1 (S2 trigger)',
-  READ_DI2: 'Read DI2 (dummy scan)',
-  READ_INPUTS_REG: 'Read Registers'
+  READ_DI0: 'Read DI0', READ_DI1: 'Read DI1', READ_INPUTS_REG: 'Read Registers'
 };
 
 function loadIoSettings() {
-  // الدمج مع الافتراضي مهم: أي مدخل جديد (زي READ_DI2) مش موجود في
-  // localStorage القديم، ومن غير الدمج ده كان هيظهر فاضي في المودال
-  // وبعد الحفظ كان هيتبعت NaN للسيرفر.
-  let saved = null;
-  try {
-    const raw = localStorage.getItem('io_mapping_v2');
-    if (raw) saved = JSON.parse(raw);
-  } catch (e) {
-    saved = null;                       // JSON بايظ — نرجع للافتراضي
-  }
-  return { ...ioDefaultMapping, ...(saved || {}) };
-}
-
-/*
- * مصدر الحقيقة هو config.json على السيرفر، مش localStorage.
- * قبل كده المودال كان بيفتح على نسخة المتصفح، فلو حد عدّل الملف على
- * الجهاز أو فتح من متصفح تاني كان بيشوف أرقام قديمة.
- * لو الطلب فشل (أوفلاين / مش Developer) بنرجع للنسخة المحلية زي الأول.
- */
-async function loadIoSettingsFromServer() {
-  try {
-    const res = await fetch('/mapping', { cache: 'no-store' });
-    if (!res.ok) return loadIoSettings();
-    const data = await res.json();
-    if (!data || typeof data !== 'object') return loadIoSettings();
-    const merged = { ...ioDefaultMapping, ...data };
-    try { localStorage.setItem('io_mapping_v2', JSON.stringify(merged)); } catch (e) {}
-    return merged;
-  } catch (e) {
-    return loadIoSettings();
-  }
+  const saved = localStorage.getItem('io_mapping_v2');
+  return saved ? JSON.parse(saved) : ioDefaultMapping;
 }
 
 function createIoSelectGroup(funcId, funcName, currentValue) {
@@ -576,12 +540,8 @@ function renderIoForm(mapping) {
   if (!outContainer || !inContainer) return;
   outContainer.innerHTML = '';
   inContainer.innerHTML  = '';
-  const pin = id => {
-    const v = parseInt(mapping[id], 10);
-    return Number.isFinite(v) ? v : ioDefaultMapping[id];
-  };
-  for (const [id, name] of Object.entries(ioOutputs)) outContainer.appendChild(createIoSelectGroup(id, name, pin(id)));
-  for (const [id, name] of Object.entries(ioInputs))  inContainer.appendChild(createIoSelectGroup(id, name, pin(id)));
+  for (const [id, name] of Object.entries(ioOutputs)) outContainer.appendChild(createIoSelectGroup(id, name, mapping[id]));
+  for (const [id, name] of Object.entries(ioInputs))  inContainer.appendChild(createIoSelectGroup(id, name, mapping[id]));
 }
 
 function resetIoMapping() {
@@ -1612,28 +1572,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   RT.on('process_status', checkBootId);
 
-  // الطلب ده بيتكرر كل ثانيتين. من غير timeout، لو السيرفر قبل الاتصال
-  // وما ردّش، كل دورة كانت بتسيب طلب معلّق — والمتصفح بيسمح بـ 6 اتصالات
-  // للهوست الواحد، فبعد ~12 ثانية كل طلبات الصفحة التانية بتقف في الطابور
-  // ورا طلبات ميتة، والواجهة كلها تبان معلّقة.
-  let watchInFlight = false;
-
   const watchServerRestart = async () => {
-    if (watchInFlight) return;          // ما نكوّمش طلبات فوق بعض
-    watchInFlight = true;
-
-    const ctrl  = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
-
     try {
-      const res = await fetch('/process/status', { cache: 'no-store', signal: ctrl.signal });
+      const res = await fetch('/process/status', { cache: 'no-store' });
       if (!res.ok) return;
       checkBootId(await res.json());
     } catch (e) {
-      /* السيرفر مقفول أو بطيء دلوقتي — هنحاول تاني في الدورة الجاية */
-    } finally {
-      clearTimeout(timer);
-      watchInFlight = false;
+      /* السيرفر مقفول دلوقتي — هنحاول تاني في الدورة الجاية */
     }
   };
   watchServerRestart();
@@ -1660,16 +1605,8 @@ document.addEventListener('DOMContentLoaded', () => {
       e.preventDefault();
       const formData = new FormData(this);
       const newMapping = {};
-      let bad = null;
-      formData.forEach((value, key) => {
-        const n = parseInt(value, 10);
-        // السيرفر بيرفض أي قيمة مش رقم بـ 400، فبنمسكها هنا الأول
-        // ونقول للمستخدم اسم الحقل بدل رسالة عامة.
-        if (!Number.isFinite(n)) { bad = bad || key; return; }
-        newMapping[key] = n;
-      });
-      if (bad) { showToast('Invalid pin value for ' + bad, 'red'); return; }
-      try { localStorage.setItem('io_mapping_v2', JSON.stringify(newMapping)); } catch (e) {}
+      formData.forEach((value, key) => newMapping[key] = parseInt(value));
+      localStorage.setItem('io_mapping_v2', JSON.stringify(newMapping));
       fetch('/save_mapping', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1685,8 +1622,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnIo    = $('btnIoMapping');
     const btnClose = $('btnCloseIoMapping');
     if (btnIo)    btnIo.addEventListener('click', () => {
-      renderIoForm(loadIoSettings());                       // رسم فوري من النسخة المحلية
-      loadIoSettingsFromServer().then(renderIoForm);        // وبعدين تحديث من config.json
+      renderIoForm(loadIoSettings());
       loadEndpoints();
       loadVisionMasterPaths();
       loadFeatures();

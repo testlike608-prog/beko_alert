@@ -204,7 +204,9 @@ class ProcessController:
                 return
 
             workers = [
-                ("io_read", app._IO_read),
+                ("io_read_SCANNER", app._IO_read_SCANNER),
+                ("io_read_S1", app._IO_read_S1),
+                ("io_read_S2", app._IO_read_S2),
                 ("vision_station_2", app._vision_station_2),
                 ("vision_station_1", app._vision_station_1),
             ]
