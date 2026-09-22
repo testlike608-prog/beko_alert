@@ -26,7 +26,12 @@ DEFAULT_SETTINGS = {
     "autoSendGap": 120,
     "dbTimeout": 10,
     "ImageTimeout": 10,
-    "PlcSignal": 0.1
+    "PlcSignal": 0.1,
+    "dummyScannerPulse": 0.3,
+    "s1ScannerOffDelay": 0.5,
+    "s1LightingOffDelay": 0.5,
+    "s2ScannerOffDelay": 0.7,
+    "s2TestDoneDelay": 0.5
 }
 
 @time_settings_bp.route('/time_settings', methods=['GET'])

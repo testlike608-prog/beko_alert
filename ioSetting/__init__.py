@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from typing import Any, Dict
 
 from flask import Blueprint, request, jsonify
@@ -337,16 +338,48 @@ load_mapping()
 
 
 # ----------------------------------------------------------------------
-# الدالة الشاملة لبناء الكود
+# Transaction ID
+#
+# الـ TID هو اللي بيربط الرد بالطلب في Modbus/TCP. كان ثابت "0001" في كل
+# الأوامر، فلما بقى في أكتر من ثريد على نفس السوكيت مكانش في أي طريقة
+# نعرف بيها الرد دا بتاع أنهي طلب — وده اللي كان بيخلي قراءة DI0 تاخد رد
+# DI1 أو DI2 وتخترع حافة صاعدة وهمية.
+#
+# دلوقتي كل أمر بياخد رقم جديد (1..0xFFFF وبيلف)، و TCPClient.send_request
+# بتتأكد إن الرد راجع بنفس الرقم قبل ما تستخدمه.
 # ----------------------------------------------------------------------
-def generate_modbus_command(function_name, action):
+_tid_lock = threading.Lock()
+_tid_counter = 0
+
+
+def next_transaction_id() -> int:
+    """بترجع Transaction ID جديد. thread-safe."""
+    global _tid_counter
+    with _tid_lock:
+        _tid_counter = (_tid_counter % 0xFFFF) + 1
+        return _tid_counter
+
+
+def _mbap(payload_len: int, tid: int) -> str:
+    """
+    بتبني الـ MBAP header:
+        TID(2) + Protocol(2) + Length(2) + UnitID(1)
+    payload_len = طول الـ PDU (function code + الداتا) من غير الـ UnitID.
+    """
+    return f"{tid:04X}" + "0000" + f"{payload_len + 1:04X}" + "01"
+
+
+def generate_modbus_command(function_name, action, tid: int | None = None):
     if function_name not in io_mapping:
         return "Error: Function not mapped"
 
     pin_number = io_mapping[function_name]
     pin_hex = f"{pin_number:04X}"
 
-    header = "00010000000601"
+    if tid is None:
+        tid = next_transaction_id()
+
+    header = _mbap(5, tid)          # function code + address(2) + value(2)
 
     if action == "ON":
         return header + "05" + pin_hex + "FF00"
@@ -358,6 +391,42 @@ def generate_modbus_command(function_name, action):
         return header + "03" + pin_hex + "0001"
 
     return "Error: Unknown action"
+
+
+def generate_modbus_read_block(start: int, count: int, tid: int | None = None) -> str:
+    """
+    أمر Read Discrete Inputs (FC 02) لعدد مداخل ورا بعض في طلب واحد.
+
+    مثال: generate_modbus_read_block(0, 8) بتقرا المداخل من عنوان 0 لعنوان 7
+    وبترجّعهم كلهم في بايت واحد — بدل تلات طلبات منفصلة لـ DI0 و DI1 و DI2.
+    """
+    if tid is None:
+        tid = next_transaction_id()
+    return _mbap(5, tid) + "02" + f"{start:04X}" + f"{count:04X}"
+
+
+def get_di_addresses() -> Dict[str, int]:
+    """عناوين الـ Discrete Inputs من الـ mapping: {"READ_DI0": 0, ...}"""
+    return {k: v for k, v in io_mapping.items() if k.startswith("READ_DI")}
+
+
+def build_di_block_request() -> tuple[str, int, int]:
+    """
+    بتبني أمر قراءة واحد يغطّي كل عناوين الـ DI الموجودة في الـ mapping.
+
+    بترجّع (hex_command, start, count) — الـ start محتاجينه بعدين عشان
+    نحوّل رقم البِت في الرد لعنوان الـ input الحقيقي.
+    """
+    addresses = get_di_addresses().values()
+    if not addresses:
+        return generate_modbus_read_block(0, 1), 0, 1
+
+    start = min(addresses)
+    count = max(addresses) - start + 1
+    # حد أمان: لو حد حط عنوان كبير بالغلط في الـ mapping ما نطلبش
+    # بلوك ضخم من الموديول
+    count = max(1, min(count, 64))
+    return generate_modbus_read_block(start, count), start, count
 
 
 # ----------------------------------------------------------------------

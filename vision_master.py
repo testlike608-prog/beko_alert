@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import traceback
+import logstore
 from typing import Optional
 
 # ----------------------------------------------------------------------
@@ -361,6 +362,15 @@ class VisionMasterController:
 
     MAX_LOG = 2000
 
+    # كل ما فلو يخلّص شغلة، الـ callback بتتنده. مع ContinuousRunEnable
+    # ده بيحصل عشرات المرات في الثانية لكل فلو — يعني سطر لوج لكل شغلة،
+    # والترمينال بيغرق والـ log list بيتقص كل شوية فبتضيع الرسايل المهمة.
+    #
+    # العدّاد نفسه مفيد وبيظهر في status()، فبنكمّل نعدّ عادي بس بنطبع
+    # ملخّص كل RUN_LOG_INTERVAL ثانية بدل سطر لكل run.
+    # خليها 0 لو عايزة ترجّعي سطر لكل شغلة (للديباج بس).
+    RUN_LOG_INTERVAL = 5.0
+
     def __init__(self):
         self._lock = threading.RLock()
         self._sol_cls = None
@@ -368,6 +378,9 @@ class VisionMasterController:
         # مهم جدًا: نحتفظ بمرجع للـ callbacks وإلا الـ GC بيمسحها
         self._handlers: list[tuple[object, object]] = []
         self._counters: dict[str, int] = {}
+        # آخر مرة طبعنا فيها ملخّص لكل فلو، وعدد الشغلات من ساعتها
+        self._run_log_last: dict[str, float] = {}
+        self._run_log_since: dict[str, int] = {}
         self._loaded = False
         self._running = False
         self._last_error: Optional[str] = None
@@ -385,6 +398,8 @@ class VisionMasterController:
             if len(self._log) > self.MAX_LOG:
                 self._log = self._log[-(self.MAX_LOG // 2):]
         print(f"[VisionMaster][{level}] {msg}")
+        # نسخة دائمة على الديسك
+        logstore.write("VisionMaster", level, msg)
 
     def logs(self, limit: int = 200) -> list[dict]:
         with self._log_lock:
@@ -531,6 +546,8 @@ class VisionMasterController:
             self._sol_cls = sol_cls
             self._flows = flows
             self._counters = {name: 0 for name, _ in flows}
+            self._run_log_last = {}
+            self._run_log_since = {}
             self._loaded = True
 
         self._attach_handlers()
@@ -542,10 +559,36 @@ class VisionMasterController:
     # ------------------------------------------------------------------
     def _make_handler(self, flow_name: str):
         def on_work_end(*_args):
+            now = time.time()
+            message = None
+
             with self._lock:
                 self._counters[flow_name] = self._counters.get(flow_name, 0) + 1
                 count = self._counters[flow_name]
-            self._log_add("RUN", f"{flow_name} -> run #{count}")
+
+                if self.RUN_LOG_INTERVAL <= 0:
+                    message = f"{flow_name} -> run #{count}"
+                else:
+                    self._run_log_since[flow_name] = self._run_log_since.get(flow_name, 0) + 1
+                    last = self._run_log_last.get(flow_name)
+
+                    if last is None:
+                        # أول شغلة للفلو دا — نطبعها عشان نعرف إنه اشتغل
+                        self._run_log_last[flow_name] = now
+                        self._run_log_since[flow_name] = 0
+                        message = f"{flow_name} -> first run"
+
+                    elif now - last >= self.RUN_LOG_INTERVAL:
+                        elapsed = now - last
+                        done = self._run_log_since[flow_name]
+                        self._run_log_last[flow_name] = now
+                        self._run_log_since[flow_name] = 0
+                        message = (f"{flow_name} -> {done} runs in {elapsed:.0f}s "
+                                   f"({done / elapsed:.1f}/s, total {count})")
+
+            # الطباعة بره القفل عشان الـ callback ترجع بسرعة
+            if message:
+                self._log_add("RUN", message)
 
         return on_work_end
 

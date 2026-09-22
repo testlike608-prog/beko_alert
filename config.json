@@ -19,5 +19,50 @@
         "solution_path": "C:\\Users\\Automation_Meeserv\\Desktop\\vm_sdk_test.solw",
         "dry_run": false,
         "dispose_on_stop": false
+    },
+    "endpoints": {
+        "scanner_s1": {
+            "ip": "192.168.1.16",
+            "port": 7940
+        },
+        "scanner_s2": {
+            "ip": "192.168.1.17",
+            "port": 7950
+        },
+        "vision_outer": {
+            "ip": "127.0.0.1",
+            "port": 20
+        },
+        "vision_inner": {
+            "ip": "127.0.0.1",
+            "port": 30
+        },
+        "vision_outer_sn": {
+            "ip": "127.0.0.1",
+            "port": 40
+        },
+        "vision_inner_sn": {
+            "ip": "127.0.0.1",
+            "port": 50
+        },
+        "io_read": {
+            "ip": "192.168.1.30",
+            "port": 502
+        },
+        "io_write": {
+            "ip": "192.168.1.30",
+            "port": 502
+        },
+        "cam_cap_s1": {
+            "ip": "127.0.0.1",
+            "port": 70
+        },
+        "cam_cap_s2": {
+            "ip": "127.0.0.1",
+            "port": 80
+        }
+    },
+    "features": {
+        "manual_mode": false
     }
 }

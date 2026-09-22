@@ -1,6 +1,7 @@
 import csv
 import os,re,json
 import shutil
+import time
 from typing import List,Tuple,Dict,Any
 import threading
 import pandas as pd
@@ -30,8 +31,13 @@ TIME_SETTINGS = {
     'autoSendGap': 120,
     'dbTimeout': 10,
     'ImageTimeout':10, 
-    'PlcSignal' : 0.1
-    
+    'PlcSignal' : 0.1,
+    # أزمنة السيكونس اللي كانت مكتوبة في الكود
+    'dummyScannerPulse': 0.3,
+    's1ScannerOffDelay': 0.5,
+    's1LightingOffDelay': 0.5,
+    's2ScannerOffDelay': 0.7,
+    's2TestDoneDelay': 0.5,
 }
 STATION1_FILE ="Station1.csv"
 STATION2_FILE ="Station2.csv"
@@ -89,6 +95,40 @@ Manual_Scanner_MODE =False
 
 #-----------------Time settings file---------------
 TIME_SETTINGS_FILE = "time_settings.json"
+
+
+# ----------------------------------------------------------------------
+# نسخة مخبّأة من الإعدادات.
+#
+# get_time_setting بتفتح الملف من الديسك في كل نداء. ده مقبول جوه
+# السيكونس (مرة كل تلاجة) بس ممنوع في لوب بتلف 20 مرة في الثانية.
+# get_time_setting_cached بتقرا الملف مرة كل ثانية بالكتير وبترجّع
+# المخبّأ غير كده — فأي تعديل من الواجهة بيوصل خلال ثانية من غير ما
+# نفتح الملف آلاف المرات.
+# ----------------------------------------------------------------------
+_time_cache = {"data": None, "at": 0.0, "mtime": None}
+_time_cache_lock = threading.Lock()
+TIME_CACHE_TTL = 1.0
+
+
+def get_time_setting_cached(key: str):
+    now = time.time()
+    with _time_cache_lock:
+        fresh = (_time_cache["data"] is not None
+                 and now - _time_cache["at"] < TIME_CACHE_TTL)
+        if not fresh:
+            try:
+                with open(TIME_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    _time_cache["data"] = json.load(f)
+            except Exception:
+                _time_cache["data"] = dict(TIME_SETTINGS)
+            _time_cache["at"] = now
+        data = _time_cache["data"]
+
+    value = data.get(key)
+    return TIME_SETTINGS.get(key) if value is None else value
+
+
 def get_time_setting(key: str):
     try:
         with open("time_settings.json", "r", encoding="utf-8") as f:

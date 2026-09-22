@@ -365,7 +365,12 @@ const DEFAULT_TIME_SETTINGS = {
   autoSendGap: 120,
   dbTimeout: 10,
   ImageTimeout: 10,
-  PlcSignal: 0.1
+  PlcSignal: 0.1,
+  dummyScannerPulse: 0.3,
+  s1ScannerOffDelay: 0.5,
+  s1LightingOffDelay: 0.5,
+  s2ScannerOffDelay: 0.7,
+  s2TestDoneDelay: 0.5
 };
 
 let currentTimeSettings = {};
@@ -395,7 +400,12 @@ function collectTimeSettings() {
   const settings = {};
   for (const key of Object.keys(DEFAULT_TIME_SETTINGS)) {
     const el = $(key);
-    if (el) settings[key] = parseFloat(el.value) || DEFAULT_TIME_SETTINGS[key];
+    if (!el) continue;
+    // ملحوظة: كان `parseFloat(...) || DEFAULT` — ودي بتعامل 0 كأنه قيمة
+    // فاضية وبترجّع الافتراضي. مع أزمنة التأخير الجديدة، 0 قيمة صالحة
+    // (يعني من غير انتظار)، فلازم نفحص NaN صراحةً.
+    const parsed = parseFloat(el.value);
+    settings[key] = Number.isNaN(parsed) ? DEFAULT_TIME_SETTINGS[key] : parsed;
   }
   return settings;
 }
@@ -1599,6 +1609,208 @@ function initPasswordToggle() {
 /* ─────────────────────────────────────────────
    11. DOMContentLoaded — WIRE EVERYTHING UP
 ───────────────────────────────────────────── */
+// ======================================================================
+// Logs
+//
+// تبويب لكل مصدر (كل TCPClient + VisionMaster)، وفلتر بالمستوى وبحث.
+//
+// السحب incremental: كل مصدر بيفتكر آخر seq اتعرض، والسيرفر بيرجّع
+// الأسطر اللي بعده بس — عشان ما نجيبش آلاف الأسطر كل ثانية.
+// الـ polling بيشتغل وقت ما المودال مفتوح بس.
+// ======================================================================
+
+const LOG_LEVELS = ['ERROR', 'FATAL', 'WARNING', 'INFO', 'RUN', 'DEBUG'];
+const LOG_LEVEL_STYLE = {
+  ERROR:   'text-red-600 dark:text-red-400',
+  FATAL:   'text-red-700 dark:text-red-300 font-semibold',
+  WARNING: 'text-amber-600 dark:text-amber-400',
+  INFO:    'text-slate-700 dark:text-slate-300',
+  RUN:     'text-sky-600 dark:text-sky-400',
+  DEBUG:   'text-slate-400 dark:text-slate-500'
+};
+const LOG_MAX_ROWS = 2000;   // اللي متخزّن في المتصفح لكل مصدر
+
+const logState = {
+  sources: [],
+  active: null,
+  since: {},          // اسم المصدر -> آخر seq
+  rows: {},           // اسم المصدر -> أسطر
+  levels: new Set(LOG_LEVELS),
+  search: '',
+  timer: null,
+  busy: false
+};
+
+function logEscape(text) {
+  const d = document.createElement('div');
+  d.textContent = text == null ? '' : String(text);
+  return d.innerHTML;
+}
+
+function logTime(ts) {
+  const d = new Date(ts * 1000);
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+}
+
+function renderLogSourceTabs() {
+  const box = $('logSourceTabs');
+  if (!box) return;
+  box.innerHTML = '';
+  logState.sources.forEach(name => {
+    const b = document.createElement('button');
+    const on = name === logState.active;
+    b.className = 'px-3 py-1 rounded-t text-sm border-b-2 transition ' + (on
+      ? 'border-[#0382b8] text-[#0382b8] font-medium'
+      : 'border-transparent opacity-70 hover:opacity-100');
+    b.textContent = name;
+    b.addEventListener('click', () => {
+      logState.active = name;
+      renderLogSourceTabs();
+      renderLogRows();
+      fetchLogs();
+    });
+    box.appendChild(b);
+  });
+}
+
+function renderLogLevelFilters() {
+  const box = $('logLevelFilters');
+  if (!box) return;
+  box.innerHTML = '';
+  LOG_LEVELS.forEach(level => {
+    const b = document.createElement('button');
+    const on = logState.levels.has(level);
+    b.className = 'px-2 py-1 rounded border text-xs ' + (on
+      ? 'bg-slate-200 dark:bg-slate-700 border-slate-400'
+      : 'opacity-50 border-transparent');
+    b.textContent = level;
+    b.addEventListener('click', () => {
+      if (on) logState.levels.delete(level); else logState.levels.add(level);
+      renderLogLevelFilters();
+      renderLogRows();
+    });
+    box.appendChild(b);
+  });
+}
+
+function renderLogRows() {
+  const body = $('logBody');
+  if (!body) return;
+  const rows = logState.rows[logState.active] || [];
+  const needle = logState.search.toLowerCase();
+
+  const shown = rows.filter(r =>
+    logState.levels.has(r.level) &&
+    (!needle || String(r.msg).toLowerCase().includes(needle)));
+
+  if (!shown.length) {
+    body.innerHTML = '<div class="opacity-50">no log lines</div>';
+  } else {
+    body.innerHTML = shown.map(r => {
+      const cls = LOG_LEVEL_STYLE[r.level] || LOG_LEVEL_STYLE.INFO;
+      return `<div class="${cls}"><span class="opacity-50">${logTime(r.ts)}</span> `
+           + `<span class="font-semibold">${logEscape(r.level)}</span> ${logEscape(r.msg)}</div>`;
+    }).join('');
+  }
+
+  const auto = $('logAutoScroll');
+  if (!auto || auto.checked) body.scrollTop = body.scrollHeight;
+
+  const st = $('logStatus');
+  if (st) st.textContent = `${shown.length} / ${rows.length}`;
+}
+
+async function loadLogSources() {
+  try {
+    const res = await fetch('/logs/sources');
+    const data = await res.json();
+    if (!data.ok) return;
+    logState.sources = data.sources || [];
+    if (!logState.active || !logState.sources.includes(logState.active)) {
+      logState.active = logState.sources[0] || null;
+    }
+    renderLogSourceTabs();
+
+    const info = $('logFileInfo');
+    if (info && data.file_log) {
+      info.textContent = data.file_log.disabled
+        ? `file log disabled: ${data.file_log.last_error || 'unknown error'}`
+        : `file log: ${data.file_log.file}`;
+    }
+  } catch (e) { /* الواجهة بتفضل شغالة حتى لو السيرفر مرد */ }
+}
+
+async function fetchLogs() {
+  if (!logState.active || logState.busy) return;
+  logState.busy = true;
+  try {
+    const name = logState.active;
+    const since = logState.since[name] || 0;
+    const res = await fetch(`/logs?source=${encodeURIComponent(name)}&since=${since}`);
+    const data = await res.json();
+    if (!data.ok) return;
+
+    logState.since[name] = data.since;
+    if (data.rows && data.rows.length) {
+      const list = (logState.rows[name] || []).concat(data.rows);
+      logState.rows[name] = list.length > LOG_MAX_ROWS ? list.slice(-LOG_MAX_ROWS) : list;
+      if (name === logState.active) renderLogRows();
+    }
+  } catch (e) {
+    /* تجاهل — الـ polling الجاي هيحاول تاني */
+  } finally {
+    logState.busy = false;
+  }
+}
+
+function startLogPolling() {
+  stopLogPolling();
+  const ms = Math.max(400, (currentTimeSettings.logPolling || DEFAULT_TIME_SETTINGS.logPolling));
+  logState.timer = setInterval(fetchLogs, ms);
+}
+
+function stopLogPolling() {
+  if (logState.timer) { clearInterval(logState.timer); logState.timer = null; }
+}
+
+function initLogsModal() {
+  const btnLogs = $('btnLogs');
+  const modal = $('logsModal');
+  if (!btnLogs || !modal) return;
+
+  const open = async () => {
+    modal.classList.remove('hidden');
+    renderLogLevelFilters();
+    await loadLogSources();
+    await fetchLogs();
+    renderLogRows();
+    startLogPolling();
+  };
+  const close = () => { modal.classList.add('hidden'); stopLogPolling(); };
+
+  btnLogs.addEventListener('click', open);
+  const x = $('btnCloseLogs');
+  if (x) x.addEventListener('click', close);
+  modal.addEventListener('click', function (e) { if (e.target === this) close(); });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !modal.classList.contains('hidden')) close();
+  });
+
+  const search = $('logSearch');
+  if (search) search.addEventListener('input', e => {
+    logState.search = e.target.value || '';
+    renderLogRows();
+  });
+
+  const clear = $('btnLogClear');
+  if (clear) clear.addEventListener('click', () => {
+    // بيمسح العرض بس — اللي على الديسك وفي السيرفر زي ما هو
+    logState.rows[logState.active] = [];
+    renderLogRows();
+  });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
 
   // إعادة التحميل بعد إعادة تشغيل السيرفر (بدل ما يتفتح تاب جديد).
@@ -1811,6 +2023,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Login page
   initPasswordToggle();
+
+  initLogsModal();
 
   // Manual scanner modals (shared)
   initAlertBell();

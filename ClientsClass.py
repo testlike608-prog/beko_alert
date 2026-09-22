@@ -13,7 +13,13 @@ import textwrap
 from queue import Empty
 from flask import url_for, Flask
 import ioSetting
-from ioSetting import generate_modbus_command
+import logstore
+from ioSetting import (
+    generate_modbus_command,
+    generate_modbus_read_block,
+    build_di_block_request,
+    get_di_addresses,
+)
 
 # هتحتفظ بس بالأمر ده وتمسح الباقي
 CMD_OFF_ALL = "000100000009010F00000010020000"
@@ -448,6 +454,24 @@ class  TCPClient():
         self.connected = False
         # يتفعّل عند الضغط على Stop لإيقاف كل اللوبات الخلفية بشكل نظيف
         self._stop_event = threading.Event()
+        # ------------------------------------------------------------------
+        # قفل السوكيت.
+        #
+        # أكتر من ثريد بيستخدموا نفس الـ TCPClient (لوب القراءة + سيكونس
+        # محطة 1 + سيكونس محطة 2). من غير القفل ده، ثريد ممكن يعمل recv
+        # فياخد رد الطلب بتاع ثريد تاني — والثريد التاني يستنى لحد الـ
+        # timeout. اللي كان بيحصل: قراءة DI0 تاخد قيمة DI1 أو DI2، والحالة
+        # السابقة تتغير من غير ما الحساس يتحرك، فتتخلق حافة صاعدة وهمية
+        # والسيكونس يتنده تاني والإضاءة تنور وتطفي طول ما الحساس قارئ.
+        #
+        # القفل بيخلي (إرسال + استقبال) عملية واحدة مش قابلة للتقسيم.
+        # أمر Modbus واحد بياخد ~5ms، فمفيش أي تعطيل محسوس بين المحطتين.
+        # ------------------------------------------------------------------
+        self._io_lock = threading.RLock()
+        # عدّاد الفريمات المتأخرة اللي اترمت — بيتطبع ملخّص كل 5 ثواني
+        # بدل سطر لكل واحدة، عشان الترمينال ما يغرقش
+        self._stale_frames = 0
+        self._stale_last_report = 0.0
         self._send_queue: "queue.Queue[dict]" = queue.Queue()
         self._log_lock = threading.Lock()
         self._log_seq = 0
@@ -529,11 +553,17 @@ class  TCPClient():
                 # لو لقيناه فصل، نصلحه
                 self.ensure_connected()
             else:
-                # لو متصل، نتأكد إنه "فعلاً" لسه شغال
+                # لو متصل، نتأكد إنه "فعلاً" لسه شغال.
+                #
+                # قبل كده كانت بتبعت self.sock.send(b'', socket.MSG_OOB) —
+                # كتابة على نفس السوكيت من ثريد تالت وخارج أي قفل، وكل 3
+                # ثواني، فكانت بتقدر تزحلق ستريم الردود. دلوقتي بنفحص
+                # السوكيت من غير ما نكتب عليه حاجة خالص.
                 try:
-                    # محاولة إرسال بايت فارغ للتأكد من الـ Socket
-                    # MSG_PEEK بتشوف الداتا من غير ما تسحبها، أو ابعت حرف تافه لو السيرفر بيسمح
-                    self.sock.send(b'', socket.MSG_OOB) 
+                    with self._io_lock:
+                        if self.sock is None:
+                            raise OSError("socket is gone")
+                        self.sock.fileno()          # بيرمي OSError لو اتقفل
                 except Exception:
                     self._log_add("WARNING", "Connection lost in background!")
                     self.connected = False
@@ -546,9 +576,73 @@ class  TCPClient():
         local_ip, local_port = self.sock.getsockname()
         return local_ip,local_port
    
+    # ------------------------------------------------------------------
+    # مساعدات الاستقبال
+    # ------------------------------------------------------------------
+    def _drain_socket(self):
+        """
+        بتفضّي أي ردود متأخرة لسه في البافر.
+
+        مهمة بعد أي timeout: الرد المتأخر بيفضل مستني في السوكيت، ولو
+        سبناه هيتسرق من الطلب اللي بعده وكل الردود بعد كده تبقى مزحلقة
+        بواحد — وده بيخلي قراءة DI0 ترجّع قيمة DI1 للأبد.
+        """
+        if self.sock is None:
+            return
+        try:
+            self.sock.setblocking(False)
+            while True:
+                if not self.sock.recv(self.buffer_size):
+                    break
+        except (BlockingIOError, OSError):
+            pass
+        finally:
+            try:
+                self.sock.settimeout(self.timeout)
+            except OSError:
+                pass
+
+    def _report_stale_frames(self):
+        """ملخّص الفريمات المتأخرة، مرة كل 5 ثواني على الأكثر."""
+        if not self._stale_frames:
+            return
+        now = time.time()
+        if now - self._stale_last_report < 5:
+            return
+        self._stale_last_report = now
+        count, self._stale_frames = self._stale_frames, 0
+        self._log_add("WARNING", f"{count} stale modbus frame(s) dropped in the last 5s")
+
+    def _recv_exactly(self, count):
+        """بتقرا عدد بايتات محدد بالظبط، أو بترمي socket.timeout."""
+        buf = b""
+        while len(buf) < count:
+            chunk = self.sock.recv(count - len(buf))
+            if not chunk:
+                raise ConnectionResetError("peer closed the connection")
+            buf += chunk
+        return buf
+
+    def _recv_modbus_frame(self):
+        """
+        بتقرا فريم Modbus/TCP كامل بالظبط — مش أول حاجة تيجي من البافر.
+
+        الفريم = MBAP(6) + الطول المكتوب في البايتات 4:6.
+        القراءة بالطول دي هي اللي بتمنع إن فريمين يتلزقوا في recv واحدة أو
+        إن نص فريم يتقرا ويتحسب رد كامل.
+        """
+        header = self._recv_exactly(6)
+        length = int.from_bytes(header[4:6], "big")
+        if not (1 <= length <= 253):
+            raise ValueError(f"bad MBAP length {length}")
+        return header + self._recv_exactly(length)
+
     def send_request(self, message , is_hex=False):
         """
         إرسال واستقبال فقط (بدون إغلاق الاتصال)
+
+        كل الكلام ده بيحصل جوه self._io_lock عشان يفضل (إرسال + استقبال)
+        عملية واحدة. من غير القفل ده، ثريد ممكن ياخد رد ثريد تاني.
         """
         # بعد الضغط على Stop مش بنحاول نبعت أو نعيد الاتصال
         if self._stop_event.is_set():
@@ -572,18 +666,51 @@ class  TCPClient():
                 data_to_send = message.encode('utf-8')
                 #data_to_send = [chunk.encode('utf-8') for chunk in message]
 
-            # 2. الإرسال
-           
-            self.sock.sendall(data_to_send)
+            # أوامر Modbus بس هي اللي ليها MBAP وTransaction ID.
+            # باقي الأجهزة (السكانر، الفيجن، كاميرا الكابتشر) بروتوكول نصي.
+            is_modbus = (
+                (is_hex or isinstance(message, bytes))
+                and len(data_to_send) >= 8
+                and data_to_send[2:4] == b"\x00\x00"
+            )
+            expected_tid = data_to_send[:2] if is_modbus else None
 
-            # 3. الاستقبال (هنا هيفضل مستني لحد ما السيرفر يرد)
-            # طالما timeout=None أو وقت كبير، هيفضل واقف هنا (Blocking)
-            response = self.sock.recv(self.buffer_size)
+            with self._io_lock:
+                # 2. الإرسال
+                self.sock.sendall(data_to_send)
 
-            return  response
+                # 3. الاستقبال
+                if not is_modbus:
+                    return self.sock.recv(self.buffer_size)
+
+                # Modbus: نقرا فريمات كاملة لحد ما نلاقي الرد بتاع الطلب ده.
+                # أي فريم برقم قديم هو رد متأخر من طلب سابق — نرميه ونكمّل،
+                # وبكده السوكيت بيرجع متزامن لوحده بدل ما يفضل مزحلق.
+                for _ in range(8):
+                    response = self._recv_modbus_frame()
+                    if response[:2] == expected_tid:
+                        return response
+                    # لوب القراءة بتلف 20 مرة في الثانية، فلو الموديول بقى
+                    # تعبان الرسالة دي ممكن تغرق الترمينال. بنعدّها ونطبعها
+                    # مرة كل 5 ثواني بالعدد — المعلومة بتوصل من غير سيل لوج.
+                    self._stale_frames += 1
+
+                self._log_add("ERROR", "could not resync modbus stream")
+                self._drain_socket()
+                return None
 
         except (socket.timeout):
             self._log_add("WARNING", f"[{self.ip}]:[{self.port}] Timeout: Server took too long to respond.")
+            # الرد المتأخر لازم يتشال من البافر، وإلا هيتسرق من الطلب الجاي
+            with self._io_lock:
+                self._drain_socket()
+            return None
+
+        except ValueError as e:
+            # فريم مش مفهوم (طول غلط) — نفضّي ونكمّل بدل ما نبني على داتا غلط
+            self._log_add("WARNING", f"[{self.ip}]:[{self.port}] Bad frame ({e}) - draining")
+            with self._io_lock:
+                self._drain_socket()
             return None
 
         except (OSError, BrokenPipeError, ConnectionResetError, socket.error) as e:
@@ -608,7 +735,11 @@ class  TCPClient():
         except Exception as e:
             print(f"[{self.ip}]:[{self.port}] General Error: {e}")
             return None
-    
+
+        finally:
+            # ملخّص الفريمات المتأخرة (لو في) - مرة كل 5 ثواني بالكتير
+            self._report_stale_frames()
+
     '''
     def _start_monitoring(self):
         """بدء خيط المراقبة"""
@@ -654,6 +785,8 @@ class  TCPClient():
             if len(self._log) > 5000:
                 self._log = self._log[-3000:]
         print(f"[{self.name}][{level}] {msg}")
+        # نسخة دائمة على الديسك: اللي في الرامة بيتقص وبيضيع مع القفل
+        logstore.write(self.name or "unnamed", level, msg)
     
     def start_listening(self, callback=None):
         """
@@ -729,7 +862,20 @@ class App():
         
         
         self.lock = threading.Lock()
-        
+
+        # ------------------------------------------------------------------
+        # حالة كل محطة لوحدها — مش قفل مشترك.
+        # المحطتين بيشتغلوا في نفس الوقت عادي؛ الفلاج دي بتمنع بس إن نفس
+        # المحطة تفتح سيكونس تاني وهي لسه شغالة.
+        # ------------------------------------------------------------------
+        self._station_busy = {1: False, 2: False}
+        self._station_busy_lock = threading.Lock()
+
+        # مدى عناوين الـ DI اللي أمر القراءة الواحد بيغطّيه.
+        # الأمر نفسه بيتبني كل مرة من جديد عشان ياخد Transaction ID جديد.
+        _, self._di_start, self._di_count = build_di_block_request()
+        self._di_addr = get_di_addresses()
+
         # timestamps for each dummy
         self.last_dummy_time_station_one = {}  # dict {dummy_number: timestamp}
         self.last_dummy_time_station_two = {}
@@ -740,6 +886,11 @@ class App():
 
         self.cam_cap_s1= TCPClient(Ip_cam_cap_s1, Port_cam_cap_s1, timeout=2 )
         self.cam_cap_s2 = TCPClient(Ip_cam_cap_s2, Port_cam_cap_s2, timeout=2 )
+
+        # كل كلاينت ياخد اسمه عشان اللوج يبقى معروف مصدره.
+        # لازم تتنادى هنا بعد آخر كلاينت — قبل كده كان في 4 كلاينتس
+        # لسه ماتعملوش (IO read/write و capture s1/s2).
+        self._name_clients()
 
         # علم الإيقاف العام للعملية (Start / Stop من الواجهة)
         self._stop_event = threading.Event()
@@ -753,6 +904,45 @@ class App():
     # ------------------------------------------------------------------
     # Start / Stop helpers
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # أسماء العملاء.
+    #
+    # الاسم كان فاضي في كل الكلاينتس، فكل سطر لوج كان بيطلع "[][INFO] ..."
+    # ومكنش ينفع تعرفي السطر ده جاي من مين. الأسماء دي هي اللي بتتقسم
+    # عليها تبويبات اللوجز في الواجهة، فلازم تفضل ثابتة.
+    # ------------------------------------------------------------------
+    CLIENT_NAMES = {
+        "client_read_io": "IO Read",
+        "client_write_io": "IO Write",
+        "client_scanner_station1": "Scanner S1",
+        "client_scanner_station2": "Scanner S2",
+        "client_Vision_station1": "Vision S1",
+        "client_Vision_station2": "Vision S2",
+        "client_Vision_station1_SN": "Vision SN S1",
+        "client_Vision_station2_SN": "Vision SN S2",
+        "cam_cap_s1": "Capture S1",
+        "cam_cap_s2": "Capture S2",
+    }
+
+    def _name_clients(self):
+        """بتدي كل كلاينت اسمه. بتتنادى مرة واحدة في __init__."""
+        for attr, label in self.CLIENT_NAMES.items():
+            client = getattr(self, attr, None)
+            if client is not None:
+                client.name = label
+
+    def client_sources(self):
+        """
+        [(الاسم, الكلاينت)] لكل مصدر لوج — بيستخدمها راوتر اللوجز
+        عشان يبني تبويب لكل مصدر.
+        """
+        pairs = []
+        for attr, label in self.CLIENT_NAMES.items():
+            client = getattr(self, attr, None)
+            if client is not None:
+                pairs.append((label, client))
+        return pairs
+
     def all_clients(self):
         """كل عملاء الـ TCP الموجودين في التطبيق"""
         return [
@@ -800,7 +990,10 @@ class App():
         # 2. إطفاء كل المخارج قبل قفل الاتصال
         try:
             if self.client_write_io.connected:
-                self.client_write_io.sock.sendall(bytes.fromhex(CMD_OFF_ALL))
+                # send_request بترجع None بعد الـ stop_event، فبنبعت مباشرة —
+                # بس جوه القفل عشان ما نقاطعش أمر لسه بيتبعت من سيكونس شغال.
+                with self.client_write_io._io_lock:
+                    self.client_write_io.sock.sendall(bytes.fromhex(CMD_OFF_ALL))
         except Exception as e:
             print(f"[shutdown] could not send OFF_ALL: {e}")
 
@@ -896,141 +1089,175 @@ class App():
     
     
 # servers handling
-    def _IO_read_SCANNER(self):
-            global your_s1_arrived_flag, your_s2_arrived_flag
-            self.client_read_io._log_add("INFO", f"start reading DI2 from io")
+    # ------------------------------------------------------------------
+    # قراءة الـ I/O
+    #
+    # قبل كده كان في تلات ثريدات (DI0 و DI1 و DI2) بيقروا من نفس الـ
+    # TCPClient. الردود كانت بتتشابك على السوكيت المشترك، فقراءة DI0
+    # كانت بتاخد قيمة DI1 أو DI2، والمتغير بتاع الحالة السابقة يتذبذب من
+    # غير ما الحساس يتحرك، فتتخلق حافة صاعدة وهمية والسيكونس يتنده تاني
+    # والإضاءة تنور وتطفي طول ما التلاجة واقفة قدام الحساس.
+    #
+    # دلوقتي ثريد واحد بيبعت أمر Read Discrete Inputs واحد بيرجّع كل
+    # المداخل في بايت واحد. يعني الحالات الثلاثة بتتقرا في نفس اللحظة
+    # بالظبط — simultaneity حقيقية، مش تزاحم — وترافيك أقل 3x على
+    # الموديول. كل حافة بتتحوّل لسيكونس في ثريد مستقل، فمحطة 1 ومحطة 2
+    # بيشتغلوا في نفس الوقت من غير ما حد يستنى التاني.
+    # ------------------------------------------------------------------
+    def _read_di_snapshot(self):
+        """
+        بترجّع {عنوان: 0/1} لكل المداخل في لقطة واحدة،
+        أو None لو القراءة فشلت (مش نفس معنى "كله صفر").
+        """
+        # Transaction ID جديد كل قراءة — هو اللي بيخلي أي رد متأخر من طلب
+        # سابق يتعرف ويتترمي بدل ما يتحسب قراءة حالية
+        cmd = generate_modbus_read_block(self._di_start, self._di_count)
+        resp = self.client_read_io.send_request(cmd, is_hex=True)
 
-            # ----------------------------------------------------------
-            # DI2 = حساس الدَمي.
-            # التريجر على الحافة النازلة (negative edge): 1 -> 0.
-            #
-            # الترتيب هنا مقصود: بنقرا -> نحفظ القراءة السابقة في prev
-            # -> نحدّث last_DI2 فورًا -> وبعدين نقارن ونبعت.
-            # تحديث الحالة قبل الإرسال معناه إن أي استثناء في send_request
-            # (انقطاع لحظي مثلاً) ما يخليش نفس الحافة تتقرا تاني في الدورة
-            # الجاية وتعمل سكان مكرر للدَمي.
-            #
-            # وأي قراءة فاشلة (respond فاضي) بنتجاهلها من غير ما نلمس
-            # last_DI2، عشان ما نخترعش حافة نازلة من انقطاع في الشبكة.
-            # ----------------------------------------------------------
-            last_DI2 = b"\x00"
+        if not resp or len(resp) < 9:
+            return None
 
-            while self.client_read_io.connected and not self._stop_event.is_set():
-                try:
-                    # توليد كود القراءة بناءً على إعدادات الويب
-                    cmd_di2 = generate_modbus_command("READ_DI2", "READ_DI")
-                    DI2_respond = self.client_read_io.send_request(message=cmd_di2, is_hex=True)
+        func = resp[7]
+        if func == 0x82:                                  # exception من الموديول
+            self.client_read_io._log_add(
+                "ERROR", f"Modbus exception on DI read: {resp[8]:#04x}")
+            return None
+        if func != 0x02:
+            return None
 
-                    if not DI2_respond:
-                        time.sleep(0.01)
-                        continue
+        byte_count = resp[8]
+        data = resp[9:9 + byte_count]
+        if len(data) != byte_count or byte_count == 0:
+            return None
 
-                    current_DI2 = DI2_respond[-1:]
-                    prev_DI2, last_DI2 = last_DI2, current_DI2
+        # أول بايت فيه أقل العناوين، وأقل بِت في البايت هو عنوان البداية
+        bits = int.from_bytes(data, "little")
+        return {addr: (bits >> (addr - self._di_start)) & 1
+                for addr in self._di_addr.values()}
 
-                    # حافة نازلة: كان 1 وبقى 0
-                    if current_DI2 == b"\x00" and prev_DI2 == b"\x01":
-                            self.client_write_io.send_request(generate_modbus_command("SCANNER_S1", "ON"), is_hex=True)    # scanner ON
-                            time.sleep(0.1)
-                            self.client_write_io.send_request(generate_modbus_command("SCANNER_S1", "OFF"), is_hex=True)    # scanner OFF
-                            self.client_read_io._log_add("INFO", f"FRIDGE DUMMY SCANNED")
-
-                    time.sleep(0.01)
-
-                except Exception as e:
-                    self.client_read_io._log_add("INFO", f"خطأ في القراءة: {e}")
-       
-    def _IO_read_S1(self):
-            global your_s1_arrived_flag, your_s2_arrived_flag
-            self.client_read_io._log_add("INFO", f"start reading from io")
-            last_DI0 = b"\x00"
-            last_DI1 = b"\x00"
-
-            while self.client_read_io.connected and not self._stop_event.is_set():
-                try:
-                    # توليد كود القراءة بناءً على إعدادات الويب
-                    cmd_di0 = generate_modbus_command("READ_DI0", "READ_DI")
-                    DI0_respond = self.client_read_io.send_request(message=cmd_di0, is_hex=True)
-
-                    if DI0_respond and DI0_respond[-1:] == b"\x01" and last_DI0 == b"\x00":
-                        threading.Thread(target=self._IO_Writer_station_1, daemon=True).start()
-                        self.client_read_io._log_add("INFO", f"found fridg in station 1")
-                        your_s1_arrived_flag = True
-                    last_DI0 = DI0_respond[-1:] if DI0_respond else b"\x00"
-                    time.sleep(0.01)
-                    
-                except Exception as e:
-                    self.client_read_io._log_add("INFO", f"خطأ في القراءة: {e}")
-       
-    def _IO_read_S2(self):
-            global your_s1_arrived_flag, your_s2_arrived_flag
-            self.client_read_io._log_add("INFO", f"start reading from io")
-            last_DI0 = b"\x00"
-            last_DI1 = b"\x00"
-
-            while self.client_read_io.connected and not self._stop_event.is_set():
-                try:
-                    # توليد كود القراءة بناءً على إعدادات الويب
-                    
-
-                    cmd_di1 = generate_modbus_command("READ_DI1", "READ_DI")
-                    DI1_respond = self.client_read_io.send_request(message=cmd_di1, is_hex=True)
-                    
-                    if DI1_respond and DI1_respond[-1:] == b"\x01" and last_DI1 == b"\x00":
-                        threading.Thread(target=self._IO_Writer_station_2, daemon=True).start()
-                        result2 =self.cam_cap_s2.send_request("S2")
-                        self.client_read_io._log_add("INFO", f"found fridg in station 2")
-                        your_s2_arrived_flag = True
-                    last_DI1 = DI1_respond[-1:] if DI1_respond else b"\x00"
-                    time.sleep(0.01)
-                except Exception as e:
-                    self.client_read_io._log_add("INFO", f"خطأ في القراءة: {e}")
-
-
-    '''
     def _IO_read(self):
-            global your_s1_arrived_flag, your_s2_arrived_flag
-            self.client_read_io._log_add("INFO", f"start reading from io")
-            last_DI0 = b"\x00"
-            last_DI1 = b"\x00"
+        self.client_read_io._log_add(
+            "INFO",
+            f"start reading I/O - one request covers DI addresses "
+            f"{self._di_start}..{self._di_start + self._di_count - 1}")
 
-            while self.client_read_io.connected and not self._stop_event.is_set():
-                try:
-                    # توليد كود القراءة بناءً على إعدادات الويب
-                    cmd_di0 = generate_modbus_command("READ_DI0", "READ_DI")
-                    DI0_respond = self.client_read_io.send_request(message=cmd_di0, is_hex=True)
-                    cmd_di2 = generate_modbus_command("READ_DI2", "READ_DI")
-                    DI2_respond = self.client_read_io.send_request(message=cmd_di2, is_hex=True)
-                    last_DI2 = DI2_respond[-1:] if DI2_respond else b"\x00"
-                    if DI2_respond and DI2_respond[-1:] == b"\x00" and last_DI2 == b"\x01":
-                            self.client_write_io.send_request(generate_modbus_command("SCANNER_S1", "ON"), is_hex=True)    # scanner ON
-                            time.sleep(0.1)
-                            self.client_write_io.send_request(generate_modbus_command("SCANNER_S1", "OFF"), is_hex=True)    # scanner OFF
-                            self.client_read_io._log_add("INFO", f"FRIDGE DUMMY SCANNED")
+        # None = لسه ماقريناش حاجة مؤكدة.
+        # مهم: القراءة الفاشلة مش بتصفّر الحالة السابقة — لو صفّرناها،
+        # أي timeout كان هيخلي القراءة اللي بعده تتحسب حافة صاعدة جديدة
+        # والسيكونس يتكرر والتلاجة ساكنة مكانها.
+        last = {addr: None for addr in self._di_addr.values()}
 
-                    last_DI2 = DI2_respond[-1:] if DI2_respond else b"\x00"
-                    if DI0_respond and DI0_respond[-1:] == b"\x01" and last_DI0 == b"\x00":
-                        threading.Thread(target=self._IO_Writer_station_1, daemon=True).start()
-                        self.client_read_io._log_add("INFO", f"found fridg in station 1")
-                        your_s1_arrived_flag = True
-                    last_DI0 = DI0_respond[-1:] if DI0_respond else b"\x00"
-                    
-                    time.sleep(0.01)
+        addr_s1 = self._di_addr.get("READ_DI0")
+        addr_s2 = self._di_addr.get("READ_DI1")
+        addr_dummy = self._di_addr.get("READ_DI2")
 
-                    cmd_di1 = generate_modbus_command("READ_DI1", "READ_DI")
-                    DI1_respond = self.client_read_io.send_request(message=cmd_di1, is_hex=True)
-                    
-                    if DI1_respond and DI1_respond[-1:] == b"\x01" and last_DI1 == b"\x00":
-                        threading.Thread(target=self._IO_Writer_station_2, daemon=True).start()
-                        result2 =self.cam_cap_s2.send_request("S2")
-                        self.client_read_io._log_add("INFO", f"found fridg in station 2")
-                        your_s2_arrived_flag = True
-                    last_DI1 = DI1_respond[-1:] if DI1_respond else b"\x00"
-                    
-                except Exception as e:
-                    self.client_read_io._log_add("INFO", f"خطأ في القراءة: {e}")
-  
-      '''
+        while self.client_read_io.connected and not self._stop_event.is_set():
+            try:
+                state = self._read_di_snapshot()
+                if state is None:
+                    time.sleep(0.05)
+                    continue                     # سيب last زي ما هي
+
+                def rising(addr):
+                    return (addr is not None
+                            and state.get(addr) == 1
+                            and last.get(addr) == 0)
+
+                if rising(addr_s1):
+                    self.trigger_station(1, source="io")
+                if rising(addr_s2):
+                    self.trigger_station(2, source="io")
+                if rising(addr_dummy):
+                    self._pulse_dummy_scanner()
+
+                # كل الحالات بتتحدّث من نفس اللقطة
+                last = state
+                time.sleep(0.05)
+
+            except Exception as e:
+                self.client_read_io._log_add("INFO", f"خطأ في القراءة: {e}")
+                time.sleep(0.05)
+
+    def _pulse_dummy_scanner(self):
+        """نبضة سكانر الدمي عند حافة DI2 — في ثريد عشان متعطّلش القراءة."""
+        def _runner():
+            try:
+                self.client_write_io.send_request(
+                    generate_modbus_command("SCANNER_S1", "ON"), is_hex=True)
+                time.sleep(hlb.get_time_setting_cached('dummyScannerPulse'))
+                self.client_write_io.send_request(
+                    generate_modbus_command("SCANNER_S1", "OFF"), is_hex=True)
+                self.client_read_io._log_add("INFO", "FRIDGE DUMMY SCANNED")
+            except Exception as exc:
+                self.client_read_io._log_add("ERROR", f"dummy scanner pulse failed: {exc}")
+
+        threading.Thread(target=_runner, name="beko-dummy-scan", daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # نقطة الدخول الوحيدة لسيكونس المحطة
+    #
+    # الـ busy flag بتاعة كل محطة لوحدها: لو محطة 1 شغالة، حافة على
+    # محطة 2 بتشتغل عادي. ولو جت حافة تانية على نفس المحطة وهي لسه
+    # شغالة بتتتجاهل وتتكتب في اللوج بدل ما تفتح سيكونس موازي.
+    # ------------------------------------------------------------------
+    def trigger_station(self, station: int, source: str = "io") -> bool:
+        """بترجع True لو السيكونس اتشغّل فعلًا، و False لو المحطة لسه شغالة."""
+        global your_s1_arrived_flag, your_s2_arrived_flag
+
+        if station not in (1, 2):
+            return False
+
+        with self._station_busy_lock:
+            if self._station_busy[station]:
+                self.client_read_io._log_add(
+                    "INFO",
+                    f"station {station} is still busy - trigger from {source} ignored")
+                return False
+            self._station_busy[station] = True
+
+        if station == 1:
+            your_s1_arrived_flag = True
+        else:
+            your_s2_arrived_flag = True
+
+        self.client_read_io._log_add(
+            "INFO", f"found fridge in station {station} (source: {source})")
+
+        target = self._IO_Writer_station_1 if station == 1 else self._IO_Writer_station_2
+
+        def _runner():
+            try:
+                target()
+            except Exception as exc:
+                self.client_read_io._log_add(
+                    "FATAL", f"station {station} sequence crashed: {exc}")
+            finally:
+                with self._station_busy_lock:
+                    self._station_busy[station] = False
+
+        threading.Thread(target=_runner, name=f"beko-station{station}", daemon=True).start()
+        return True
+
+    def is_station_busy(self, station: int) -> bool:
+        with self._station_busy_lock:
+            return bool(self._station_busy.get(station))
+
+    def _all_outputs_off(self, station: int):
+        """
+        بتطفي مخارج محطة واحدة بس.
+
+        البديل CMD_OFF_ALL بيستخدم function 15 وبيكتب صفر على الـ 16 كويل
+        مرة واحدة — يعني لو محطة وقعت فيها exception كانت بتطفي مخارج
+        المحطة التانية كمان وهي شغالة. ده بيخلي المحطتين مستقلين فعلًا.
+        """
+        for coil in (f"LIGHTING_S{station}", f"SCANNER_S{station}",
+                     f"BUZZER_S{station}", f"TESTDONE_S{station}"):
+            try:
+                self.client_write_io.send_request(
+                    generate_modbus_command(coil, "OFF"), is_hex=True)
+            except Exception as exc:
+                self.client_write_io._log_add(
+                    "ERROR", f"could not switch {coil} off: {exc}")
 
     def _vision_station_1(self):
         """
@@ -1542,11 +1769,11 @@ class App():
             self.client_write_io.send_request(generate_modbus_command("TESTDONE_S1", "OFF"), is_hex=True)
 
             
-            time.sleep(0.5)
+            time.sleep(hlb.get_time_setting_cached('s1ScannerOffDelay'))
             #self.client_write_io.send_request(generate_modbus_command("SCANNER_S1", "OFF"), is_hex=True)   # scanner OFF
             self.client_scanner_station1._log_add("info", f"light on")
 
-            time.sleep(0.5)
+            time.sleep(hlb.get_time_setting_cached('s1LightingOffDelay'))
             self.client_write_io.send_request(generate_modbus_command("LIGHTING_S1", "OFF"), is_hex=True)   # lighting OFF
 
             try:
@@ -1582,9 +1809,15 @@ class App():
                         return
 
                     Manual_Scanner_MODE = True
+                    # البازر بيتشغّل مرة واحدة وبعدين بننام لحد ما الانتظار
+                    # يخلص. قبل كده كان في لوب بيبعت أمر Modbus من غير أي
+                    # sleep — آلاف الأوامر في الثانية على نفس سوكيت الكتابة،
+                    # فكانت محطة 2 مش بتعرف تبعت ولا أمر طول ما محطة 1
+                    # مستنية دمي. دي نفس طريقة محطة 2 بالظبط.
+                    self.client_write_io.send_request(
+                        generate_modbus_command("BUZZER_S1", "ON"), is_hex=True)  # buzzer on
                     while  is_waiting and not self._stop_event.is_set():
-
-                        self.client_write_io.send_request(generate_modbus_command("BUZZER_S1", "ON"), is_hex=True)  # buzzer on
+                        time.sleep(0.5)
 
                     self.client_write_io.send_request(generate_modbus_command("BUZZER_S1", "OFF"), is_hex=True)  # buzzer off
                     is_waiting = True
@@ -1653,7 +1886,10 @@ class App():
                    self.client_scanner_station1._log_add("FATAL", f"ERROR WHILE SCANNING DUMMY NUMBER: {e}")
         except Exception as e:
             self.client_write_io._log_add("FATAL", f"S1 device init error: {e}")
-            self.client_write_io.send_request(CMD_OFF_ALL,is_hex=True)
+            # كويلات محطة 1 بس. CMD_OFF_ALL بتكتب صفر على الـ 16 كويل
+            # دفعة واحدة، فكانت بتطفي إضاءة وسكانر وبازر محطة 2 وهي في نص
+            # السيكونس بتاعها.
+            self._all_outputs_off(1)
             return
 
         # FIX: Capture the starting state before waiting
@@ -1737,11 +1973,11 @@ class App():
             self.client_write_io._log_add("INFO", f"S2 capture trigger response: {result2}")
             
 
-            time.sleep(0.7)
+            time.sleep(hlb.get_time_setting_cached('s2ScannerOffDelay'))
             self.client_write_io.send_request(generate_modbus_command("SCANNER_S2", "OFF"), is_hex=True)    #  scanner OFF
             self.client_scanner_station2._log_add("info", f"light on")
 
-            time.sleep(0.5)
+            time.sleep(hlb.get_time_setting_cached('s2TestDoneDelay'))
             self.client_write_io.send_request(generate_modbus_command("TESTDONE_S2", "ON"), is_hex=True)
 
             plc_signal_period = hlb.get_time_setting('PlcSignal')
@@ -1811,7 +2047,8 @@ class App():
                    self.client_scanner_station2._log_add("FATAL", f"ERROR WHILE SCANNING DUMMY NUMBER: {e}")
         except Exception as e:
             self.client_write_io._log_add("FATAL", f"S2 device init error: {e}")
-            self.client_write_io.send_request(CMD_OFF_ALL,is_hex=True)
+            # كويلات محطة 2 بس — نفس سبب محطة 1
+            self._all_outputs_off(2)
             return
 
         # FIX: Capture the starting state before waiting

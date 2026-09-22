@@ -22,6 +22,7 @@ from .routers import (
     flash_router,
     home_router,
     io_setting_router,
+    logs_router,
     manual_router,
     process_router,
     sql_router,
@@ -72,6 +73,7 @@ def create_app() -> FastAPI:
     app.include_router(manual_router.router)
     app.include_router(io_setting_router.router)
     app.include_router(flags_router.router)
+    app.include_router(logs_router.router)
     app.include_router(tests_router.router)
 
     @app.get("/", include_in_schema=False, name="root")

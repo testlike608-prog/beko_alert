@@ -203,10 +203,11 @@ class ProcessController:
             if app.is_stopping():
                 return
 
+            # ثريد قراءة واحد بيغطّي DI0 و DI1 و DI2 في طلب Modbus واحد.
+            # قبل كده كانوا تلات ثريدات على نفس السوكيت، فالردود كانت
+            # بتتشابك وتخترع حواف صاعدة وهمية.
             workers = [
-                ("io_read_SCANNER", app._IO_read_SCANNER),
-                ("io_read_S1", app._IO_read_S1),
-                ("io_read_S2", app._IO_read_S2),
+                ("io_read", app._IO_read),
                 ("vision_station_2", app._vision_station_2),
                 ("vision_station_1", app._vision_station_1),
             ]
